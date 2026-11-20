@@ -1,0 +1,41 @@
+[package]
+name = "telegordo"
+version = "0.1.0"
+edition = "2024"
+description = "A discordo-style Telegram client for the terminal"
+repository = "https://github.com/fabianwgl/telegordo"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0.104"
+arboard = "3.7.0"
+base64 = "0.23.1"
+chrono = "0.4.45"
+clap = { version = "4.6.9", features = ["derive"] }
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+directories = "6.0.0"
+futures = "0.3.34"
+image = "0.25.10"
+keyring = "4.2.0"
+libc = "0.2.191"
+notify-rust = "4.19.0"
+nucleo-matcher = "0.3.1"
+qrcode = "0.15.0"
+rand = "0.10.4"
+ratatui = "0.30.2"
+ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm", "image-defaults"] }
+ratatui-textarea = "0.9.4"
+serde = { version = "1.0.229", features = ["derive"] }
+syntect = { version = "5.3.0", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
+tdlib-rs = { version = "1.4.0", features = ["download-tdlib", "static"] }
+tokio = { version = "1.54.1", features = ["full"] }
+toml = "1.2.1"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+unicode-width = "0.2.0"
+
+[build-dependencies]
+tdlib-rs = { version = "1.4.0", features = ["download-tdlib", "static"] }
+
+[dev-dependencies]
+serde_json = "1.0.154"
