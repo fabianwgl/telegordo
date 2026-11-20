@@ -215,6 +215,8 @@ pub fn wrap(spans: &[Span<'static>], width: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut cur: Vec<Span<'static>> = Vec::new();
     let mut cur_w = 0usize;
+    // The current line began with a soft wrap (not a `\n`).
+    let mut soft = false;
 
     let push_piece = |cur: &mut Vec<Span<'static>>, text: &str, style: Style| {
         if let Some(last) = cur.last_mut()
@@ -232,6 +234,7 @@ pub fn wrap(spans: &[Span<'static>], width: usize) -> Vec<Line<'static>> {
             if k > 0 {
                 lines.push(Line::from(std::mem::take(&mut cur)));
                 cur_w = 0;
+                soft = false;
             }
             // Split into alternating runs of spaces and non-spaces.
             let mut rest = segment;
@@ -246,8 +249,8 @@ pub fn wrap(spans: &[Span<'static>], width: usize) -> Vec<Line<'static>> {
                 rest = &rest[end..];
                 let w = str_width(token);
                 if is_space {
-                    if cur_w == 0 && !lines.is_empty() && cur.is_empty() {
-                        continue; // no leading spaces after a soft wrap
+                    if soft && cur_w == 0 && cur.is_empty() {
+                        continue; // no leading spaces after a soft wrap; indentation stays
                     }
                     let fit = w.min(width.saturating_sub(cur_w));
                     if fit > 0 {
@@ -260,6 +263,7 @@ pub fn wrap(spans: &[Span<'static>], width: usize) -> Vec<Line<'static>> {
                     trim_trailing_spaces(&mut cur);
                     lines.push(Line::from(std::mem::take(&mut cur)));
                     cur_w = 0;
+                    soft = true;
                 }
                 if w <= width {
                     push_piece(&mut cur, token, style);
@@ -277,6 +281,7 @@ pub fn wrap(spans: &[Span<'static>], width: usize) -> Vec<Line<'static>> {
                         chunk.clear();
                         chunk_w = 0;
                         cur_w = 0;
+                        soft = true;
                     }
                     chunk.push(c);
                     chunk_w += cw;
@@ -414,6 +419,18 @@ mod tests {
             plain(&wrap(&spans, 5)),
             vec!["hello", "world", "foo", "bar"]
         );
+    }
+
+    #[test]
+    fn newlines_keep_indentation() {
+        let want = vec!["fn f() {", "    x();", "}"];
+        let spans = vec![Span::raw("fn f() {\n    x();\n}")];
+        assert_eq!(plain(&wrap(&spans, 20)), want);
+        let code = highlight("fn f() {\n    x();\n}", "rust", "base16-ocean.dark");
+        assert_eq!(plain(&wrap(&code, 20)), want);
+        // A soft wrap still never starts a line with spaces.
+        let spans = vec![Span::raw("aaaa    bbbb")];
+        assert_eq!(plain(&wrap(&spans, 6)), vec!["aaaa", "bbbb"]);
     }
 
     #[test]
