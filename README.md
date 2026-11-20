@@ -10,20 +10,10 @@ It is a full user client (your own account, not a bot), built on
 [tdlib-rs](https://github.com/FedericoBruzzone/tdlib-rs) and drawn with
 [ratatui](https://ratatui.rs).
 
-```
-╭ Chats ─────────╮╭ Family · Alice is typing… ───────────────────────────╮
-│▾ All chats    1││───────────────── November 18, 2026 ─────────────────│
-│    Family     3││Alice  11:06AM                                        │
-│    Muted news 9││Hello there, how are you?                             │
-│    Saved Messa…││Me  11:08AM                                           │
-│▸ Work          ││╭ ↪ Alice: Hello there, how are you?                  │
-│                ││Great thanks                                          │
-│                │╰──────────────────────────────────────────────────────╯
-│                │╭ Message ─────────────────────────────────────────────╮
-│                ││                                                      │
-╰────────────────╯╰──────────────────────────────────────────────────────╯
- ctrl+g chats · ctrl+t messages · ctrl+i composer · ctrl+k picker · alt+. help
-```
+![telegordo with the chat tree on the left, a group chat with an inline photo in the middle, and a reply being written below it](docs/screenshots/chat.png)
+
+Colors come from your terminal's palette. These screenshots use Ghostty with
+the Catppuccin Mocha theme.
 
 ## Features
 
@@ -54,6 +44,10 @@ It is a full user client (your own account, not a bot), built on
 - Login by phone number, code and two-step password, or by QR code.
 - The session database is encrypted with a random key stored in the OS
   keyring (macOS Keychain, Secret Service on Linux).
+
+| Forum topics and code blocks | Quick switcher (`ctrl+k`) |
+| --- | --- |
+| ![A forum group expanded into its topics in the chat tree, with the Help topic open and a highlighted Rust code block](docs/screenshots/topics.png) | ![The quick switcher over the chat view, listing a forum group and its topics for the query "ru"](docs/screenshots/picker.png) |
 
 See [ROADMAP.md](ROADMAP.md) for what is not built yet.
 
@@ -207,6 +201,12 @@ cargo clippy --all-targets -- -D warnings
 macOS asks for Keychain access again after every rebuild, because unsigned
 binaries change identity with each build. Set `keyring = false` under
 `[telegram]` in a dev config to avoid the prompts.
+
+`scripts/screenshots.sh` regenerates the screenshots in `docs/screenshots/`.
+An ignored test (`src/screenshots.rs`) draws the real UI with made-up chats.
+The script replays each frame in a Ghostty window and captures that window.
+No Telegram account is used. The script needs macOS, Ghostty and Screen
+Recording permission for your terminal.
 
 ## License
 

@@ -6,6 +6,8 @@ mod config;
 mod keymap;
 mod notify;
 #[cfg(test)]
+mod screenshots;
+#[cfg(test)]
 mod testutil;
 mod tg;
 mod ui;
