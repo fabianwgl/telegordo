@@ -32,14 +32,30 @@ the Catppuccin Mocha theme.
 - Other media show as placeholders (`[Video 0:32]`, `[Voice 0:12]`,
   `[File report.pdf 2.1 MB]`). `o` opens the file and `D` saves it to
   `~/Downloads`.
+  - Before opening a file that can run code (`.jar`, `.command`, `.sh`,
+    `.exe`, `.desktop`, `.html` and similar, or anything executable), `o`
+    asks first. On macOS, opened files get the `com.apple.quarantine` mark,
+    so Gatekeeper checks them like browser downloads.
 - Composer:
   - Sending uses markdown (`**bold**`, `__italic__`, `~~strike~~`,
     `||spoiler||`, `` `code` ``, fenced code, `[text](url)`).
-  - Reply, edit and delete (with a confirmation). `up` in an empty composer
-    edits your last message, and `ctrl+e` writes the message in `$EDITOR`.
+  - Reply, edit and delete. `up` in an empty composer edits your last
+    message, and `ctrl+e` writes the message in `$EDITOR`.
+  - Editing a message without formatting edits it as plain text: `__init__`
+    or `2**10**` stays as typed. A formatted message opens as markdown. If it
+    has formatting markdown cannot express (underline, mentions without a
+    username, quotes, custom emoji), the first `enter` says what saving would
+    remove, and a second `enter` saves. Saving an unchanged edit does nothing.
+  - Delete asks "for everyone" or "for me" depending on what Telegram allows
+    (`y` confirms, `m` deletes only for you, any other key cancels).
+  - A message that fails to send shows `failed: <reason>` in red, and the
+    text goes back into the composer.
+  - Unsent text is kept per chat while you look at another chat.
   - Typing indicators work in both directions.
 - Quick switcher (`ctrl+k`): fuzzy search across chats and loaded topics.
 - Desktop notifications for new messages while the terminal is unfocused.
+  Chats muted directly or through Telegram's defaults for private chats,
+  groups or channels stay silent.
 - Mouse support: clicking selects, and the wheel scrolls.
 - Login by phone number, code and two-step password, or by QR code.
 - The session database is encrypted with a random key stored in the OS
@@ -53,7 +69,7 @@ See [ROADMAP.md](ROADMAP.md) for what is not built yet.
 
 ## Install
 
-Requires a recent stable Rust (developed with 1.100; Rust 2024 edition). The
+Requires Rust 1.88 or newer (developed with 1.100; Rust 2024 edition). The
 build downloads a prebuilt TDLib 1.8.61 and links it statically, so the binary
 only needs system libraries.
 
@@ -94,7 +110,7 @@ Desktop Device and scan the code.
 
 | Where | Keys |
 |---|---|
-| Global | `ctrl+g` chats · `ctrl+t` messages · `ctrl+i` composer · `ctrl+h`/`ctrl+l` previous/next pane · `alt+g` toggle sidebar · `ctrl+k` picker · `ctrl+z` suspend · `ctrl+d` log out · `ctrl+c` quit |
+| Global | `ctrl+g` chats · `ctrl+t` messages · `ctrl+i` composer · `ctrl+h`/`ctrl+l` previous/next pane · `alt+g` toggle sidebar · `ctrl+k` picker · `ctrl+z` suspend · `ctrl+d` log out (asks first) · `ctrl+c` quit |
 | Chats | `j`/`k` move · `g`/`G` top/bottom · `enter` open/expand · `-` collapse parent · `_` collapse all · `p` parent · `J`/`K` next/previous unread · `i` copy ID |
 | Messages | `j`/`k` select · `g`/`G` top/bottom · `J`/`K` scroll · `s` go to replied message · `r`/`R` reply · `e` edit · `d` delete · `o` open attachment · `D` download · `y` copy text · `u` copy link · `i` copy ID · `esc` clear selection |
 | Composer | `enter` send · `shift+enter` newline · `esc` cancel reply or edit, or clear · `up` edit last message · `ctrl+e` open `$EDITOR` |
@@ -108,17 +124,34 @@ bar shows the keys in use. tmux does not pass the protocol through, even with
 `extended-keys on`, so the `alt+` keys apply inside tmux. The log file records
 which mode was picked.
 
+**Focus note:** notifications and read receipts use the terminal's focus
+events. In tmux, turn them on with `set -g focus-events on`. Until the
+terminal reports focus at least once, telegordo notifies for every chat except
+the open one, and marks messages in the open chat as read.
+
+**Clipboard note:** `y`, `u` and `i` copy through the system clipboard. When
+there is none (over SSH, or without a display), they ask the terminal to copy
+with OSC 52; in tmux this needs `set -g set-clipboard on`.
+
+**History note:** after `s` jumps to a reply far back, a dim
+`older messages not loaded` line marks the part of the history in between. It
+loads as soon as it scrolls into view.
+
 ## Configuration
 
 The config file is optional. Every key has a default, and you only write the
-ones you want to change. It is read from:
+ones you want to change. telegordo uses the first of these that exists:
 
 1. `$XDG_CONFIG_HOME/telegordo/config.toml`, if that variable is set
 2. `~/.config/telegordo/config.toml` (on macOS too)
-3. macOS: `~/Library/Application Support/telegordo/config.toml`
-4. or the path given to `--config-path`
+3. the platform config directory: on macOS
+   `~/Library/Application Support/telegordo/config.toml` (on Linux this is
+   the same as 1 or 2)
 
-The first file that exists wins.
+`--config-path FILE` skips this lookup and uses `FILE`, which must exist.
+
+Unknown keys, unknown colors, borders and image protocols are reported in the
+status line at startup (all of them in the log) and otherwise ignored.
 
 ```toml
 mouse = true
@@ -170,13 +203,24 @@ selected_bg = "#3a3a3a"
 timestamp_color = "darkgray"
 unread_color = "yellow"
 
-# Rebind any action: one key or a list. Action names are listed by alt+. in the app.
+# Rebind any action: one key or a list. alt+. in the app lists every action
+# with its name and section; the names are also listed below.
 [keys.global]
 quit = ["ctrl+q", "ctrl+c"]
 
 [keys.messages]
 reply = "r"
 ```
+
+Action names for `[keys.<section>]`:
+
+| Section | Actions |
+|---|---|
+| `global` | `focus_chats` `focus_messages` `focus_composer` `focus_previous` `focus_next` `toggle_sidebar` `picker` `toggle_help` `suspend` `logout` `quit` |
+| `tree` | `up` `down` `top` `bottom` `page_up` `page_down` `select` `collapse_parent` `collapse_all` `move_to_parent` `next_unread` `prev_unread` `yank_id` |
+| `messages` | `up` `down` `top` `bottom` `scroll_up` `scroll_down` `select_reply` `reply` `edit` `delete` `open` `download` `yank_text` `yank_url` `yank_id` `cancel` |
+| `composer` | `send` `newline` `cancel` `edit_last` `open_editor` |
+| `picker` | `up` `down` `select` `cancel` |
 
 ## Files
 
@@ -185,10 +229,11 @@ reply = "r"
   - Linux: `~/.local/share/telegordo/`
   - or the path given to `--data-dir`
 - Logs, replaced on each run: `telegordo.log` (this app) and `tdlib.log`
-  (TDLib), both in the platform cache directory.
+  (TDLib), both in the platform cache directory and readable only by you.
   - Change the app log with `--log-path` and `--log-level debug|info|warn|error`.
 
-`ctrl+d` logs out. That removes the session from Telegram, deletes the local
+`ctrl+d` asks "Log out of Telegram and delete the local session? y / N".
+Only `y` logs out. That removes the session from Telegram, deletes the local
 database and deletes its key from the keyring.
 
 ## Development

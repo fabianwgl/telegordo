@@ -69,11 +69,48 @@ fn entity_style(t: &TextEntityType, opts: &RenderOpts) -> Option<Style> {
     })
 }
 
+/// Makes text safe to measure and draw: tabs become spaces up to the next
+/// multiple of 4 columns, and other control characters except `\n` are
+/// dropped (ratatui would drop them anyway, after `wrap` counted them).
+/// Keeps the column across calls, so spans of one text line up.
+#[derive(Debug, Default)]
+struct Cleaner {
+    col: usize,
+}
+
+impl Cleaner {
+    const TAB: usize = 4;
+
+    fn clean(&mut self, s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                '\n' => {
+                    out.push('\n');
+                    self.col = 0;
+                }
+                '\t' => {
+                    let n = Self::TAB - self.col % Self::TAB;
+                    out.extend(std::iter::repeat_n(' ', n));
+                    self.col += n;
+                }
+                c if c.is_control() => {}
+                c => {
+                    out.push(c);
+                    self.col += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+                }
+            }
+        }
+        out
+    }
+}
+
 /// Styled spans for a formatted text. `base` is applied under every entity.
 pub fn formatted_spans(ft: &FormattedText, base: Style, opts: &RenderOpts) -> Vec<Span<'static>> {
     let chars: Vec<char> = ft.text.chars().collect();
+    let mut cleaner = Cleaner::default();
     if !opts.markdown || ft.entities.is_empty() {
-        return vec![Span::styled(ft.text.clone(), base)];
+        return vec![Span::styled(cleaner.clean(&ft.text), base)];
     }
     let ranges = utf16_to_char_ranges(
         &ft.text,
@@ -117,7 +154,7 @@ pub fn formatted_spans(ft: &FormattedText, base: Style, opts: &RenderOpts) -> Ve
             && a == i
         {
             let code: String = chars[a..b].iter().collect();
-            out.extend(highlight(&code, &lang, &opts.code_theme));
+            out.extend(highlight_with(&code, &lang, &opts.code_theme, &mut cleaner));
             blocks.next();
             i = b;
             continue;
@@ -127,14 +164,14 @@ pub fn formatted_spans(ft: &FormattedText, base: Style, opts: &RenderOpts) -> Ve
         let mut buf = String::new();
         while j < stop && j < chars.len() && styles[j] == styles[i] && spoiler[j] == spoiler[i] {
             let c = chars[j];
-            buf.push(if spoiler[j] && c != '\n' && c != ' ' {
+            buf.push(if spoiler[j] && !matches!(c, '\n' | ' ' | '\t') {
                 '░'
             } else {
                 c
             });
             j += 1;
         }
-        out.push(Span::styled(buf, styles[i]));
+        out.push(Span::styled(cleaner.clean(&buf), styles[i]));
         i = j;
     }
     out
@@ -156,10 +193,20 @@ fn theme(name: &str) -> &'static Theme {
 }
 
 /// Highlights a code block; falls back to the plain code style.
-pub fn highlight(code: &str, lang: &str, theme_name: &str) -> Vec<Span<'static>> {
+#[cfg(test)]
+fn highlight(code: &str, lang: &str, theme_name: &str) -> Vec<Span<'static>> {
+    highlight_with(code, lang, theme_name, &mut Cleaner::default())
+}
+
+fn highlight_with(
+    code: &str,
+    lang: &str,
+    theme_name: &str,
+    cleaner: &mut Cleaner,
+) -> Vec<Span<'static>> {
     let ss = syntaxes();
     let Some(syntax) = ss.find_syntax_by_token(lang) else {
-        return vec![Span::styled(code.to_string(), CODE_STYLE)];
+        return vec![Span::styled(cleaner.clean(code), CODE_STYLE)];
     };
     let mut h = HighlightLines::new(syntax, theme(theme_name));
     let mut out = Vec::new();
@@ -169,18 +216,18 @@ pub fn highlight(code: &str, lang: &str, theme_name: &str) -> Vec<Span<'static>>
                 for (st, piece) in regions {
                     let c = st.foreground;
                     out.push(Span::styled(
-                        piece.to_string(),
+                        cleaner.clean(piece),
                         Style::new().fg(Color::Rgb(c.r, c.g, c.b)),
                     ));
                 }
             }
-            Err(_) => out.push(Span::styled(line.to_string(), CODE_STYLE)),
+            Err(_) => out.push(Span::styled(cleaner.clean(line), CODE_STYLE)),
         }
     }
     out
 }
 
-/// URLs in a text: explicit links first, then bare URLs.
+/// URLs in a text (explicit links and bare URLs), in the order they appear.
 pub fn urls(ft: &FormattedText) -> Vec<String> {
     let ranges = utf16_to_char_ranges(
         &ft.text,
@@ -440,6 +487,31 @@ mod tests {
         // CJK chars are 2 columns wide.
         let spans = vec![Span::raw("日本語")];
         assert_eq!(plain(&wrap(&spans, 4)), vec!["日本", "語"]);
+    }
+
+    #[test]
+    fn tabs_become_spaces_and_wrap_agrees() {
+        let t = ft("\tx", vec![]);
+        let spans = formatted_spans(&t, Style::new(), &opts());
+        assert_eq!(plain(&wrap(&spans, 20)), vec!["    x"]);
+        // Tab stops: "ab" + tab reaches column 4.
+        let t = ft("ab\tc\n\tif x {", vec![(0, 2, TextEntityType::Bold)]);
+        let spans = formatted_spans(&t, Style::new(), &opts());
+        assert_eq!(plain(&wrap(&spans, 20)), vec!["ab  c", "    if x {"]);
+        // Widths match what is drawn: no wrapped line is wider than the pane.
+        for l in wrap(&spans, 5) {
+            assert!(l.width() <= 5, "{l:?}");
+        }
+        // Other control characters are dropped.
+        let t = ft("a\u{7}b", vec![]);
+        assert_eq!(formatted_spans(&t, Style::new(), &opts())[0].content, "ab");
+    }
+
+    #[test]
+    fn tabs_in_highlighted_code_keep_indentation() {
+        let spans = highlight("fn x() {\n\treturn;\n}\n", "rust", "base16-ocean.dark");
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("\n    return;"), "{text:?}");
     }
 
     #[test]

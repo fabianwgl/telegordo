@@ -125,6 +125,7 @@ mod tests {
                     marked_unread: false,
                     last_read_inbox: 0,
                     mute_for: 0,
+                    use_default_mute_for: false,
                 },
             );
         }

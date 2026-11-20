@@ -21,7 +21,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui_image::Image;
 
 use crate::app::{App, Auth, Focus, Modal};
-use crate::keymap::{ComposerAction, GlobalAction, MessagesAction, TreeAction};
+use crate::keymap::{ComposerAction, GlobalAction, MessagesAction, PickerAction, TreeAction};
 use crate::ui::composer::Mode;
 
 pub fn parse_color(s: &str) -> Color {
@@ -93,18 +93,51 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match &app.modal {
         Modal::None => {}
         Modal::Picker(_) => draw_picker(f, app, area),
-        Modal::Help => draw_full_help(f, app, area),
-        Modal::ConfirmDelete { .. } => {
-            let r = centered(area, 40, 5);
-            f.render_widget(Clear, r);
-            f.render_widget(
-                Paragraph::new("Delete this message? y / n")
-                    .alignment(Alignment::Center)
-                    .block(pane(app, " Confirm ", true)),
-                r,
+        Modal::Help { .. } => draw_full_help(f, app, area),
+        Modal::ConfirmDelete { rights, .. } => {
+            let text = match rights {
+                None => "Delete this message? checking…",
+                Some(r) if r.for_everyone && r.only_for_self => {
+                    "Delete for everyone? y / N · m: only for me"
+                }
+                Some(r) if r.for_everyone => "Delete for everyone? y / N",
+                Some(r) if r.only_for_self => "Delete for me? y / N",
+                Some(_) => "This message cannot be deleted.",
+            };
+            confirm(f, app, area, text);
+        }
+        Modal::ConfirmOpen { path } => {
+            let name = std::path::Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone());
+            confirm(
+                f,
+                app,
+                area,
+                &format!("{name} can run code. Open anyway? y / N"),
             );
         }
+        Modal::ConfirmLogout => confirm(
+            f,
+            app,
+            area,
+            "Log out of Telegram and delete the local session? y / N",
+        ),
     }
+}
+
+fn confirm(f: &mut Frame, app: &App, area: Rect, text: &str) {
+    let w = (unicode_width::UnicodeWidthStr::width(text) as u16 + 4).max(40);
+    let r = centered(area, w.min(area.width), 5);
+    f.render_widget(Clear, r);
+    f.render_widget(
+        Paragraph::new(text)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
+            .block(pane(app, " Confirm ", true)),
+        r,
+    );
 }
 
 fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
@@ -334,6 +367,14 @@ fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
             f.render_widget(Image::new(proto), r);
         }
     }
+    // A visible "not loaded" marker loads the messages it stands for.
+    app.wanted_gaps.extend(
+        layout
+            .gaps
+            .iter()
+            .filter(|(line, _)| (top..top + h).contains(line))
+            .map(|(_, newer_end)| *newer_end),
+    );
     app.last_ranges = layout.ranges;
 }
 
@@ -417,20 +458,25 @@ fn draw_help_bar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_full_help(f: &mut Frame, app: &App, area: Rect) {
-    let k = &app.keys;
+/// Every binding with its config name (`[keys.<section>] name = …`).
+fn help_lines(k: &crate::keymap::Keymap) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
     fn section<A: Copy + PartialEq>(
         lines: &mut Vec<Line<'static>>,
         title: &str,
+        config: &str,
         all: &[A],
         b: &crate::keymap::Bindings<A>,
+        name: fn(A) -> &'static str,
         help: fn(A) -> &'static str,
     ) {
-        lines.push(Line::styled(
-            title.to_string(),
-            Style::new().add_modifier(Modifier::BOLD),
-        ));
+        lines.push(Line::from(vec![
+            Span::styled(title.to_string(), Style::new().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("  [keys.{config}]"),
+                Style::new().fg(Color::DarkGray),
+            ),
+        ]));
         for &a in all {
             let keys: Vec<String> = b.keys(a).iter().map(|k| k.to_string()).collect();
             lines.push(Line::from(vec![
@@ -438,6 +484,7 @@ fn draw_full_help(f: &mut Frame, app: &App, area: Rect) {
                     format!("  {:<22}", keys.join(", ")),
                     Style::new().fg(Color::Gray),
                 ),
+                Span::styled(format!("{:<17}", name(a)), Style::new().fg(Color::Cyan)),
                 Span::styled(help(a).to_string(), Style::new().fg(Color::DarkGray)),
             ]));
         }
@@ -446,30 +493,47 @@ fn draw_full_help(f: &mut Frame, app: &App, area: Rect) {
     section(
         &mut lines,
         "Global",
+        "global",
         GlobalAction::ALL,
         &k.global,
+        GlobalAction::name,
         GlobalAction::help,
     );
     section(
         &mut lines,
         "Chats",
+        "tree",
         TreeAction::ALL,
         &k.tree,
+        TreeAction::name,
         TreeAction::help,
     );
     section(
         &mut lines,
         "Messages",
+        "messages",
         MessagesAction::ALL,
         &k.messages,
+        MessagesAction::name,
         MessagesAction::help,
     );
     section(
         &mut lines,
         "Composer",
+        "composer",
         ComposerAction::ALL,
         &k.composer,
+        ComposerAction::name,
         ComposerAction::help,
+    );
+    section(
+        &mut lines,
+        "Picker",
+        "picker",
+        PickerAction::ALL,
+        &k.picker,
+        PickerAction::name,
+        PickerAction::help,
     );
     if !k.enhanced {
         lines.push(Line::styled(
@@ -477,14 +541,35 @@ fn draw_full_help(f: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(Color::Yellow),
         ));
     }
+    lines
+}
+
+fn draw_full_help(f: &mut Frame, app: &mut App, area: Rect) {
+    let lines = help_lines(&app.keys);
     let r = centered(
         area,
-        60.min(area.width),
+        76.min(area.width),
         (lines.len() as u16 + 2).min(area.height),
     );
+    // Clamp the scroll to the last page, and remember it so `k` works at once.
+    let max = (lines.len() as u16).saturating_sub(r.height.saturating_sub(2));
+    let scroll = match &mut app.modal {
+        Modal::Help { scroll } => {
+            *scroll = (*scroll).min(max);
+            *scroll
+        }
+        _ => 0,
+    };
+    let title = if max > 0 {
+        " Keys · j/k scroll · other keys close "
+    } else {
+        " Keys (any key closes) "
+    };
     f.render_widget(Clear, r);
     f.render_widget(
-        Paragraph::new(lines).block(pane(app, " Keys (any key closes) ", true)),
+        Paragraph::new(lines)
+            .scroll((scroll, 0))
+            .block(pane(app, title, true)),
         r,
     );
 }
@@ -695,5 +780,78 @@ pub(crate) mod tests {
         assert_eq!(lines.iter().filter(|l| l.contains("││Alice  ")).count(), 1);
         // Full-width help bar on the last row.
         assert!(lines[19].contains("ctrl+g") && lines[19].contains("send"));
+    }
+
+    #[tokio::test]
+    async fn help_lists_config_names_and_scrolls_to_the_picker() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _rx) = testutil::app(crate::ui::image::Images::disabled(), true);
+        app.on_key(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::ALT));
+        let first = render(&mut app, 100, 30);
+        assert!(first.contains("focus_chats") && first.contains("[keys.global]"));
+        assert!(!first.contains("Picker"), "below the fold at first");
+        for _ in 0..100 {
+            app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        }
+        let last = render(&mut app, 100, 30);
+        println!("{last}");
+        assert!(
+            last.contains("select_reply"),
+            "config name, not just the label"
+        );
+        assert!(last.contains("Picker") && last.contains("[keys.picker]"));
+        assert!(
+            matches!(app.modal, Modal::Help { .. }),
+            "j scrolls, does not close"
+        );
+        app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert!(
+            matches!(app.modal, Modal::Help { scroll } if scroll > 0),
+            "k scrolls back from the clamped end"
+        );
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.modal, Modal::None));
+    }
+
+    #[tokio::test]
+    async fn failed_sends_are_marked_grouped_or_not() {
+        use tdlib_rs::enums::MessageSendingState;
+        use tdlib_rs::types::{Error, MessageSendingStateFailed};
+        let (mut app, _rx) = testutil::app(crate::ui::image::Images::disabled(), true);
+        let failed = |id, date, text: &str| {
+            let mut m = testutil::message(id, 10, 1, date, testutil::text_content(text), None);
+            m.sending_state = Some(MessageSendingState::Failed(MessageSendingStateFailed {
+                error: Error {
+                    code: 400,
+                    message: "MESSAGE_TOO_LONG".into(),
+                },
+                can_retry: false,
+                need_another_sender: false,
+                need_another_reply_quote: false,
+                need_drop_reply: false,
+                required_paid_message_star_count: 0,
+                retry_after: 0.0,
+            }));
+            m
+        };
+        // 103 follows my 102 within 5 minutes: grouped, no header of its own.
+        let b = testutil::BASE_DATE;
+        app.store
+            .insert_message(failed(103, b + 100, "grouped one"));
+        app.store.insert_message(failed(104, b + 2000, "alone one"));
+        app.current = Some(View {
+            chat_id: 10,
+            topic: None,
+        });
+        let s = render(&mut app, 100, 24);
+        println!("{s}");
+        let marked: Vec<&str> = s
+            .lines()
+            .filter(|l| l.contains("failed: MESSAGE_TOO_LONG"))
+            .collect();
+        assert_eq!(marked.len(), 2, "{marked:?}");
+        assert!(marked.iter().any(|l| l.contains("grouped one")));
+        assert!(marked.iter().any(|l| l.contains("Me")), "header of 104");
+        assert!(!s.contains("sending…"));
     }
 }

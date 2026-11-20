@@ -11,7 +11,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Deserialize;
 
 /// One or more key strings from the config.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct KeyList(pub Vec<String>);
 
 impl<'de> Deserialize<'de> for KeyList {
@@ -187,7 +187,6 @@ macro_rules! actions {
                 match self { $($name::$variant => $key),* }
             }
 
-            #[allow(dead_code)]
             pub fn help(self) -> &'static str {
                 match self { $($name::$variant => $help),* }
             }

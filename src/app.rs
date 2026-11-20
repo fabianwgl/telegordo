@@ -1,5 +1,6 @@
 //! Application state, event loop and action handling.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -19,10 +20,12 @@ use crate::config::Config;
 use crate::keymap::{
     ComposerAction, GlobalAction, Keymap, MessagesAction, PickerAction, TreeAction,
 };
-use crate::tg::store::{ListKey, Store};
+use crate::outbox::Body;
+use crate::outbox::{self, Op};
+use crate::tg::store::{ListKey, Store, message_in_topic};
 use crate::tg::{Params, Tg, View};
 use crate::ui::chats_tree::{self, NodeId, TreeState};
-use crate::ui::composer::{Composer, Mode};
+use crate::ui::composer::{self, Composer, Draft, EditOrigin, Mode};
 use crate::ui::image::{self, Images, Wanted};
 use crate::ui::messages::{self, MessagesState};
 use crate::ui::picker::ChatPicker;
@@ -37,8 +40,28 @@ pub enum Focus {
 pub enum Modal {
     None,
     Picker(ChatPicker),
-    Help,
-    ConfirmDelete { chat_id: i64, message_id: i64 },
+    /// Key list, scrolled `scroll` lines down.
+    Help {
+        scroll: u16,
+    },
+    /// `rights` is None until `getMessageProperties` answers.
+    ConfirmDelete {
+        chat_id: i64,
+        message_id: i64,
+        rights: Option<DeleteRights>,
+    },
+    ConfirmLogout,
+    /// A downloaded file that can run code.
+    ConfirmOpen {
+        path: String,
+    },
+}
+
+/// What `getMessageProperties` allows for a delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeleteRights {
+    pub for_everyone: bool,
+    pub only_for_self: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,12 +105,60 @@ pub enum AppEvent {
         result: Result<File, String>,
     },
     ImageReady {
-        file_id: i32,
+        wanted: Wanted,
         result: Result<Protocol, String>,
+    },
+    DeleteRights {
+        chat_id: i64,
+        message_id: i64,
+        result: Result<DeleteRights, String>,
     },
     Status(String),
     AuthError(String),
     Me(i64),
+    /// `logOut` failed; the session stays.
+    LogOutFailed(String),
+    /// A backwards page from the newer end of a history gap.
+    GapPage {
+        chat_id: i64,
+        newer_end: i64,
+        result: Result<Vec<Message>, String>,
+    },
+    /// Default `mute_for` of a kind of chat, fetched at login.
+    ScopeMute {
+        scope: enums::NotificationSettingsScope,
+        mute_for: i32,
+    },
+    /// A send or edit failed; `draft` is what the composer held.
+    SendFailed {
+        view: View,
+        draft: Draft,
+        error: String,
+    },
+    /// Markdown for a formatted message the user started editing.
+    EditReady {
+        view: View,
+        message_id: i64,
+        original: tdlib_rs::types::FormattedText,
+        result: Result<tdlib_rs::types::FormattedText, String>,
+    },
+}
+
+/// SIGTERM and SIGHUP, registered once for the whole run so a signal that
+/// arrives while the editor runs is seen when the loop resumes.
+pub struct Signals {
+    term: tokio::signal::unix::Signal,
+    hup: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    pub fn new() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            term: signal(SignalKind::terminate())?,
+            hup: signal(SignalKind::hangup())?,
+        })
+    }
 }
 
 /// Something the loop must do outside of normal event handling.
@@ -134,15 +205,36 @@ pub struct App {
     pub last_ranges: Vec<(i64, usize, usize)>,
     /// Images the last draw wanted.
     pub wanted: Vec<Wanted>,
+    /// Newer ends of the history gaps the last draw showed.
+    pub wanted_gaps: Vec<i64>,
     pub tx: UnboundedSender<AppEvent>,
+    /// Ordered queue of user-initiated TDLib requests.
+    pub outbox: UnboundedSender<Op>,
     pub quit_at: Option<Instant>,
     pub logging_out: bool,
+    /// TDLib reported `authorizationStateLoggingOut`: the server accepted it.
+    server_logging_out: bool,
     pub dirty: bool,
     /// Connection banner, None when connected.
     pub connection: Option<&'static str>,
     tg_closed: bool,
     pending_interrupt: Option<Interrupt>,
+    /// Kept for the whole run: on X11/Wayland the copied text lives only as
+    /// long as its owner.
+    clipboard: Option<arboard::Clipboard>,
+    /// Unsent composer text per view, kept while another chat is open.
+    drafts: HashMap<View, Draft>,
+    /// Whether the terminal ever reported focus. Without focus events
+    /// (tmux without `focus-events on`) the window counts as unfocused for
+    /// notifications.
+    focus_events_seen: bool,
+    ticks: u64,
 }
+
+/// Messages kept for a chat that is not open: none needed for a chat that
+/// was never opened beyond the last one, a page or so for one that was.
+const KEEP_UNOPENED: usize = 1;
+const KEEP_BACKGROUND: usize = 500;
 
 fn login_area(mask: bool) -> TextArea<'static> {
     let mut ta = TextArea::default();
@@ -163,6 +255,7 @@ impl App {
         tx: UnboundedSender<AppEvent>,
     ) -> Self {
         let sidebar = true;
+        let outbox = outbox::spawn(tg.clone(), tx.clone());
         Self {
             cfg,
             keys,
@@ -186,13 +279,20 @@ impl App {
             rects: Rects::default(),
             last_ranges: Vec::new(),
             wanted: Vec::new(),
+            wanted_gaps: Vec::new(),
             tx,
+            outbox,
             quit_at: None,
             logging_out: false,
+            server_logging_out: false,
             dirty: true,
             connection: None,
             tg_closed: false,
             pending_interrupt: None,
+            clipboard: None,
+            drafts: HashMap::new(),
+            focus_events_seen: false,
+            ticks: 0,
         }
     }
 
@@ -208,6 +308,7 @@ impl App {
         terminal: &mut DefaultTerminal,
         td_rx: &mut UnboundedReceiver<Update>,
         app_rx: &mut UnboundedReceiver<AppEvent>,
+        signals: &mut Signals,
     ) -> Result<Option<Interrupt>> {
         let mut events = EventStream::new();
         let mut tick = tokio::time::interval(Duration::from_millis(500));
@@ -236,9 +337,15 @@ impl App {
                     }
                 }
                 Some(ev) = app_rx.recv() => self.on_app_event(ev),
+                _ = signals.term.recv() => self.quit(),
+                _ = signals.hup.recv() => self.quit(),
                 _ = tick.tick() => {
                     if self.store.expire_typing() {
                         self.dirty = true;
+                    }
+                    self.ticks += 1;
+                    if self.ticks.is_multiple_of(120) {
+                        self.evict();
                     }
                     if let Some((_, at)) = &self.status && at.elapsed() > Duration::from_secs(5) {
                         self.status = None;
@@ -273,8 +380,15 @@ impl App {
                     enums::ConnectionState::Updating => Some("updating…"),
                     enums::ConnectionState::Ready => None,
                 };
+                if label.is_none() {
+                    // Back online: gaps that failed to load may load now.
+                    self.store.retry_failed_gaps(None);
+                }
                 self.connection = label;
                 self.dirty = true;
+            }
+            Update::MessageSendFailed(u) => {
+                self.set_status(format!("send failed: {}", u.error.message));
             }
             Update::ChatFolders(u) => {
                 for f in &u.chat_folders {
@@ -283,17 +397,23 @@ impl App {
             }
             _ => {}
         }
-        let current_new = matches!(&update, Update::NewMessage(u) if self.current.is_some_and(|v| v.chat_id == u.message.chat_id));
+        let current_new = matches!(&update, Update::NewMessage(u) if self.shows(&u.message));
         if self.store.apply(&update) {
             self.dirty = true;
         }
-        if current_new && let Update::NewMessage(u) = &update {
-            self.mark_read(u.message.chat_id, vec![u.message.id]);
+        if let Update::NewMessage(u) = &update {
+            let chat_id = u.message.chat_id;
+            if current_new {
+                self.mark_read(chat_id, vec![u.message.id]);
+            } else if self.current.is_none_or(|v| v.chat_id != chat_id) {
+                self.trim_background(chat_id);
+            }
         }
     }
 
     fn on_auth(&mut self, state: AuthorizationState) {
-        tracing::info!("auth state: {state:?}");
+        // Only the name: the payload holds the phone number and password hint.
+        tracing::info!("auth state: {}", auth_state_name(&state));
         self.login_busy = false;
         let prev_qr = matches!(self.auth, Auth::Qr(_));
         self.auth = match state {
@@ -351,10 +471,16 @@ impl App {
                 self.on_ready();
                 Auth::Ready
             }
-            AuthorizationState::LoggingOut | AuthorizationState::Closing => Auth::Closing,
+            AuthorizationState::LoggingOut => {
+                self.server_logging_out = true;
+                Auth::Closing
+            }
+            AuthorizationState::Closing => Auth::Closing,
             AuthorizationState::Closed => {
                 self.tg_closed = true;
-                if self.logging_out {
+                // Only wipe the session after Telegram started the logout;
+                // a failed or never-sent `logOut` keeps it.
+                if self.logging_out && self.server_logging_out {
                     crate::tg::forget_database_key(&self.params.key_store);
                     if let Err(e) = std::fs::remove_dir_all(&self.params.database_dir) {
                         tracing::warn!("removing session: {e}");
@@ -391,6 +517,27 @@ impl App {
                 let _ = tx.send(AppEvent::Me(i.value));
             }
         });
+        // TDLib may not send updateScopeNotificationSettings at startup.
+        for scope in [
+            enums::NotificationSettingsScope::PrivateChats,
+            enums::NotificationSettingsScope::GroupChats,
+            enums::NotificationSettingsScope::ChannelChats,
+        ] {
+            let tg = self.tg.clone();
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                match functions::get_scope_notification_settings(scope.clone(), tg.client_id).await
+                {
+                    Ok(enums::ScopeNotificationSettings::ScopeNotificationSettings(s)) => {
+                        let _ = tx.send(AppEvent::ScopeMute {
+                            scope,
+                            mute_for: s.mute_for,
+                        });
+                    }
+                    Err(e) => tracing::warn!("scope notification settings: {}", e.message),
+                }
+            });
+        }
         self.spawn_load_chats(ListKey::Main);
         self.spawn_load_chats(ListKey::Archive);
         self.focus = Focus::Tree;
@@ -405,18 +552,27 @@ impl App {
         self.dirty = true;
         match ev {
             AppEvent::History { view, from, result } => {
-                let st = self.store.history.entry(view).or_default();
-                st.loading = false;
+                self.store.history.entry(view).or_default().loading = false;
                 match result {
                     Ok(msgs) => {
                         // Fewer than asked is normal (TDLib returns what it has locally first);
                         // only an empty page means the start of the chat.
                         let got_older = msgs.iter().any(|m| from == 0 || m.id < from);
-                        if !got_older {
-                            st.reached_start = true;
+                        let before = self.store.view_messages(view).len();
+                        if view.topic.is_none() {
+                            // A chat page is contiguous: it may close a gap.
+                            let newer_end = (from != 0).then_some(from);
+                            self.store.insert_page(view.chat_id, msgs, newer_end);
+                        } else {
+                            for m in msgs {
+                                self.store.insert_message(m);
+                            }
                         }
-                        for m in msgs {
-                            self.store.insert_message(m);
+                        // A page that adds nothing to the view would be asked for again
+                        // on every draw.
+                        let grew = self.store.view_messages(view).len() > before;
+                        if !got_older || (from != 0 && !grew) {
+                            self.store.history.entry(view).or_default().reached_start = true;
                         }
                         if Some(view) == self.current && from == 0 {
                             let ids: Vec<i64> = self
@@ -439,9 +595,8 @@ impl App {
                 result,
             } => match result {
                 Ok(msgs) => {
-                    for m in msgs {
-                        self.store.insert_message(m);
-                    }
+                    // Usually far from what is loaded: this records the gap.
+                    self.store.insert_page(view.chat_id, msgs, None);
                     if Some(view) == self.current
                         && self.store.message(view.chat_id, target).is_some()
                     {
@@ -451,6 +606,29 @@ impl App {
                 }
                 Err(e) => self.set_status(format!("jump: {e}")),
             },
+            AppEvent::GapPage {
+                chat_id,
+                newer_end,
+                result,
+            } => match result {
+                Ok(msgs) => {
+                    self.store.fill_gap(chat_id, newer_end, msgs);
+                    // Messages arrived below the jump target; keep it in view.
+                    if self.current.is_some_and(|v| v.chat_id == chat_id)
+                        && self.msgs.selected.is_some()
+                    {
+                        self.msgs.reveal = true;
+                    }
+                }
+                Err(e) => {
+                    if let Some(g) = self.store.gap_mut(chat_id, newer_end) {
+                        g.loading = false;
+                        g.failed = true;
+                    }
+                    self.set_status(format!("history: {e}"));
+                }
+            },
+            AppEvent::ScopeMute { scope, mute_for } => self.store.scope_mutes.set(&scope, mute_for),
             AppEvent::Topics { chat_id, result } => match result {
                 Ok(t) => self.store.set_topics(chat_id, t),
                 Err(e) => self.set_status(format!("topics: {e}")),
@@ -462,27 +640,69 @@ impl App {
                 (FilePurpose::Image(w), Ok(_)) | (FilePurpose::Image(w), Err(_)) => {
                     self.images.entries.insert(w.file_id, image::Entry::Failed);
                 }
-                (FilePurpose::Open, Ok(f)) => open_path(&f.local.path),
-                (FilePurpose::Save(dest), Ok(f)) => {
-                    match std::fs::copy(&f.local.path, unique_path(&dest)) {
-                        Ok(_) => self.set_status(format!(
-                            "saved to {}",
-                            dest.parent().unwrap_or(&dest).display()
-                        )),
-                        Err(e) => self.set_status(format!("save failed: {e}")),
+                (FilePurpose::Open, Ok(f)) => {
+                    if can_run_code(std::path::Path::new(&f.local.path)) {
+                        self.modal = Modal::ConfirmOpen { path: f.local.path };
+                    } else {
+                        open_path(&f.local.path);
                     }
+                }
+                (FilePurpose::Save(dest), Ok(f)) => {
+                    // Files can be gigabytes: copy off the event loop.
+                    let tx = self.tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let status = match copy_unique(std::path::Path::new(&f.local.path), &dest) {
+                            Ok(p) => format!("saved to {}", p.display()),
+                            Err(e) => format!("save failed: {e}"),
+                        };
+                        let _ = tx.send(AppEvent::Status(status));
+                    });
                 }
                 (_, Err(e)) => self.set_status(format!("download failed: {e}")),
             },
-            AppEvent::ImageReady { file_id, result } => {
+            AppEvent::ImageReady { wanted, result } => {
+                let (cols, rows) = (wanted.cols, wanted.rows);
+                // Only the latest request counts; older sizes finishing late are dropped.
+                if self.images.latest_request(wanted.file_id) != Some((cols, rows)) {
+                    return;
+                }
                 let entry = match result {
-                    Ok(p) => image::Entry::Ready(p),
+                    Ok(proto) => image::Entry::Ready {
+                        proto,
+                        cols,
+                        rows,
+                        resizing: None,
+                    },
                     Err(e) => {
-                        tracing::warn!("image {file_id}: {e}");
+                        tracing::warn!("image {}: {e}", wanted.file_id);
                         image::Entry::Failed
                     }
                 };
-                self.images.entries.insert(file_id, entry);
+                self.images.entries.insert(wanted.file_id, entry);
+            }
+            AppEvent::DeleteRights {
+                chat_id,
+                message_id,
+                result,
+            } => {
+                let Modal::ConfirmDelete {
+                    chat_id: c,
+                    message_id: m,
+                    rights,
+                } = &mut self.modal
+                else {
+                    return;
+                };
+                if (*c, *m) != (chat_id, message_id) {
+                    return;
+                }
+                match result {
+                    Ok(r) => *rights = Some(r),
+                    Err(e) => {
+                        self.modal = Modal::None;
+                        self.set_status(format!("delete: {e}"));
+                    }
+                }
             }
             AppEvent::Status(s) => {
                 if !s.is_empty() {
@@ -490,6 +710,59 @@ impl App {
                 }
             }
             AppEvent::Me(id) => self.store.me = Some(id),
+            AppEvent::SendFailed { view, draft, error } => {
+                // Give the text back: into the composer if it is free, else
+                // as that chat's draft for when it is opened again.
+                if self.current == Some(view) {
+                    if self.composer.is_empty() {
+                        self.composer.restore(draft);
+                        self.set_status(format!("send failed: {error}"));
+                    } else {
+                        self.set_status(format!("send failed: {error} (text not restored)"));
+                    }
+                } else if let std::collections::hash_map::Entry::Vacant(e) = self.drafts.entry(view)
+                {
+                    e.insert(draft);
+                    let chat = self.store.chat_title(view.chat_id);
+                    self.set_status(format!(
+                        "send failed in {chat}: {error} (text kept as its draft)"
+                    ));
+                } else {
+                    self.set_status(format!("send failed: {error} (text not restored)"));
+                }
+            }
+            AppEvent::LogOutFailed(e) => {
+                self.logging_out = false;
+                self.set_status(format!("log out failed: {e}"));
+            }
+            AppEvent::EditReady {
+                view,
+                message_id,
+                original,
+                result,
+            } => {
+                if self.current != Some(view)
+                    || self.composer.mode != Mode::Edit(message_id)
+                    || !self.composer.is_empty()
+                {
+                    return;
+                }
+                match result {
+                    Ok(md) => {
+                        self.composer.set_text(&md.text);
+                        self.composer.edit = Some(EditOrigin {
+                            original,
+                            initial: md.text.clone(),
+                            lossy: composer::formatting_names(&md),
+                            warned: false,
+                        });
+                    }
+                    Err(e) => {
+                        self.composer.clear();
+                        self.set_status(format!("edit: {e}"));
+                    }
+                }
+            }
             AppEvent::AuthError(e) => {
                 self.login_busy = false;
                 self.login_error = Some(e);
@@ -505,14 +778,17 @@ impl App {
                 self.load_history(view);
             }
         }
+        if let Some(view) = self.current {
+            for newer_end in std::mem::take(&mut self.wanted_gaps) {
+                self.fill_gap(view.chat_id, newer_end);
+            }
+        }
         let wanted = std::mem::take(&mut self.wanted);
         for w in wanted {
-            if self.images.entries.contains_key(&w.file_id) {
+            if !self.images.needs(&w) {
                 continue;
             }
-            self.images
-                .entries
-                .insert(w.file_id, image::Entry::Requested);
+            self.images.request(&w);
             match self.store.files.get(&w.file_id) {
                 Some(f) if f.local.is_downloading_completed => {
                     let path = f.local.path.clone();
@@ -531,10 +807,7 @@ impl App {
         tokio::task::spawn_blocking(move || {
             let result =
                 image::encode(&picker, &path, w.cols, w.rows).map_err(|e| format!("{e:#}"));
-            let _ = tx.send(AppEvent::ImageReady {
-                file_id: w.file_id,
-                result,
-            });
+            let _ = tx.send(AppEvent::ImageReady { wanted: w, result });
         });
     }
 
@@ -569,36 +842,101 @@ impl App {
         });
     }
 
+    /// Loads backwards from a gap's newer end, the side the user came from.
+    fn fill_gap(&mut self, chat_id: i64, newer_end: i64) {
+        let Some(g) = self.store.gap_mut(chat_id, newer_end) else {
+            return;
+        };
+        if g.loading || g.failed {
+            return;
+        }
+        g.loading = true;
+        let view = View {
+            chat_id,
+            topic: None,
+        };
+        let limit = self.cfg.messages_limit;
+        let tg = self.tg.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = tg
+                .history(view, newer_end, limit)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(AppEvent::GapPage {
+                chat_id,
+                newer_end,
+                result,
+            });
+        });
+    }
+
+    /// Every minute: forget file records and encoded images that no loaded
+    /// message uses any more.
+    fn evict(&mut self) {
+        let live = self.store.evict_files();
+        self.images.entries.retain(|id, _| live.contains(id));
+    }
+
+    /// Caps the cache of a chat that is not open.
+    fn trim_background(&mut self, chat_id: i64) {
+        let opened = self.store.history.keys().any(|v| v.chat_id == chat_id);
+        let keep = if opened {
+            KEEP_BACKGROUND
+        } else {
+            KEEP_UNOPENED
+        };
+        self.store.trim_chat(chat_id, keep);
+    }
+
     fn mark_read(&self, chat_id: i64, ids: Vec<i64>) {
         if ids.is_empty() || !self.terminal_focused {
             return;
         }
-        let tg = self.tg.clone();
-        tokio::spawn(async move {
-            if let Err(e) = functions::view_messages(chat_id, ids, None, true, tg.client_id).await {
-                tracing::debug!("view_messages: {}", e.message);
-            }
-        });
+        self.request(Op::ViewMessages { chat_id, ids });
+    }
+
+    fn request(&self, op: Op) {
+        if self.outbox.send(op).is_err() {
+            tracing::warn!("outbox task is gone");
+        }
+    }
+
+    /// Whether the open view shows `m`: same chat, and same topic in a forum.
+    fn shows(&self, m: &Message) -> bool {
+        self.current.is_some_and(|v| {
+            v.chat_id == m.chat_id && v.topic.is_none_or(|t| message_in_topic(m, t))
+        })
+    }
+
+    /// Whether a new message deserves a desktop notification.
+    fn would_notify(&self, m: &Message) -> bool {
+        let n = &self.cfg.notifications;
+        if !n.enabled || m.is_outgoing || !matches!(self.auth, Auth::Ready) {
+            return false;
+        }
+        if !self.store.chats.contains_key(&m.chat_id) || self.store.message_muted(m) {
+            return false;
+        }
+        let viewing = self.shows(m);
+        if !self.focus_events_seen {
+            // Focus is unknown: notify for everything but the open chat.
+            return !viewing;
+        }
+        if !self.terminal_focused {
+            return true;
+        }
+        // Focused: only with `when_unfocused = false`, and not for the open chat.
+        !n.when_unfocused && !viewing
     }
 
     fn maybe_notify(&self, m: &Message) {
-        let n = &self.cfg.notifications;
-        if !n.enabled || m.is_outgoing || !matches!(self.auth, Auth::Ready) {
+        if !self.would_notify(m) {
             return;
         }
         let Some(chat) = self.store.chats.get(&m.chat_id) else {
             return;
         };
-        if chat.muted() {
-            return;
-        }
-        let viewing = self.current.is_some_and(|v| v.chat_id == m.chat_id);
-        if n.when_unfocused && self.terminal_focused {
-            return;
-        }
-        if !n.when_unfocused && viewing && self.terminal_focused {
-            return;
-        }
         let title = chat.title.clone();
         let sender = self.store.sender_name(&m.sender_id);
         let body = messages::snippet(m, &self.store);
@@ -628,6 +966,7 @@ impl App {
                 self.dirty = true;
             }
             Event::FocusGained => {
+                self.focus_events_seen = true;
                 self.terminal_focused = true;
                 if let Some(v) = self.current {
                     let ids: Vec<i64> = self
@@ -641,13 +980,16 @@ impl App {
                     self.mark_read(v.chat_id, ids);
                 }
             }
-            Event::FocusLost => self.terminal_focused = false,
+            Event::FocusLost => {
+                self.focus_events_seen = true;
+                self.terminal_focused = false;
+            }
             Event::Resize(..) => self.dirty = true,
             _ => {}
         }
     }
 
-    fn on_key(&mut self, k: KeyEvent) {
+    pub(crate) fn on_key(&mut self, k: KeyEvent) {
         // Quit works everywhere, even mid-login.
         if self.keys.global.lookup(&k) == Some(GlobalAction::Quit) {
             self.quit();
@@ -659,27 +1001,59 @@ impl App {
         }
         match &mut self.modal {
             Modal::Picker(_) => return self.on_picker_key(k),
-            Modal::Help => {
-                self.modal = Modal::None;
+            Modal::Help { scroll } => {
+                use crossterm::event::KeyCode;
+                match k.code {
+                    KeyCode::Char('j') | KeyCode::Down => *scroll = scroll.saturating_add(1),
+                    KeyCode::Char('k') | KeyCode::Up => *scroll = scroll.saturating_sub(1),
+                    KeyCode::PageDown => *scroll = scroll.saturating_add(10),
+                    KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+                    _ => self.modal = Modal::None,
+                }
                 return;
             }
             Modal::ConfirmDelete {
                 chat_id,
                 message_id,
+                rights,
             } => {
-                let (c, m) = (*chat_id, *message_id);
+                use crossterm::event::KeyCode;
+                let (chat_id, message_id, rights) = (*chat_id, *message_id, *rights);
+                let yes = matches!(k.code, KeyCode::Char('y' | 'Y'));
+                let me_only = matches!(k.code, KeyCode::Char('m' | 'M'));
+                let revoke = match rights {
+                    // Still asking TDLib what is allowed: only y/m wait for it.
+                    None if yes || me_only => return,
+                    None => None,
+                    Some(r) if yes && r.for_everyone => Some(true),
+                    Some(r) if yes && r.only_for_self => Some(false),
+                    Some(r) if me_only && r.for_everyone && r.only_for_self => Some(false),
+                    Some(_) => None,
+                };
                 self.modal = Modal::None;
-                if matches!(
-                    k.code,
-                    crossterm::event::KeyCode::Char('y' | 'Y') | crossterm::event::KeyCode::Enter
-                ) {
-                    let tg = self.tg.clone();
-                    let tx = self.tx.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = tg.delete(c, m).await {
-                            let _ = tx.send(AppEvent::Status(format!("delete failed: {e:#}")));
-                        }
+                if let Some(revoke) = revoke {
+                    self.request(Op::Delete {
+                        chat_id,
+                        message_id,
+                        revoke,
                     });
+                }
+                return;
+            }
+            Modal::ConfirmOpen { path } => {
+                let path = std::mem::take(path);
+                self.modal = Modal::None;
+                if matches!(k.code, crossterm::event::KeyCode::Char('y' | 'Y')) {
+                    open_path(&path);
+                }
+                return;
+            }
+            Modal::ConfirmLogout => {
+                self.modal = Modal::None;
+                if matches!(k.code, crossterm::event::KeyCode::Char('y' | 'Y')) {
+                    self.logging_out = true;
+                    self.request(Op::LogOut);
+                    self.set_status("logging out…");
                 }
                 return;
             }
@@ -708,10 +1082,8 @@ impl App {
             return;
         }
         self.quit_at = Some(Instant::now() + Duration::from_secs(3));
-        let tg = self.tg.clone();
-        tokio::spawn(async move {
-            let _ = functions::close(tg.client_id).await;
-        });
+        // Through the outbox, so sends queued before it still reach TDLib.
+        self.request(Op::Close);
         if !matches!(self.auth, Auth::Ready) && !matches!(self.auth, Auth::Starting) {
             // Nothing to flush mid-login; leave right away.
             self.quit_at = Some(Instant::now());
@@ -755,15 +1127,12 @@ impl App {
                 }
             }
             GlobalAction::Picker => self.modal = Modal::Picker(ChatPicker::new(&self.store)),
-            GlobalAction::ToggleHelp => self.modal = Modal::Help,
+            GlobalAction::ToggleHelp => self.modal = Modal::Help { scroll: 0 },
             GlobalAction::Suspend => self.pending_interrupt = Some(Interrupt::Suspend),
             GlobalAction::Logout => {
-                self.logging_out = true;
-                let tg = self.tg.clone();
-                tokio::spawn(async move {
-                    let _ = functions::log_out(tg.client_id).await;
-                });
-                self.set_status("logging out…");
+                if !self.logging_out {
+                    self.modal = Modal::ConfirmLogout;
+                }
             }
             GlobalAction::Quit => self.quit(),
         }
@@ -864,18 +1233,25 @@ impl App {
             return;
         }
         let prev = self.current.replace(view);
-        let tg = self.tg.clone();
-        let chat_id = view.chat_id;
-        tokio::spawn(async move {
-            if let Some(p) = prev
-                && p.chat_id != chat_id
-            {
-                let _ = functions::close_chat(p.chat_id, tg.client_id).await;
+        if let Some(p) = prev {
+            // Keep the unsent text of the chat being left.
+            if self.composer.is_empty() {
+                self.drafts.remove(&p);
+            } else {
+                self.drafts.insert(p, self.composer.draft());
             }
-            let _ = functions::open_chat(chat_id, tg.client_id).await;
-        });
+            if p.chat_id != view.chat_id {
+                self.request(Op::CloseChat(p.chat_id));
+                self.trim_background(p.chat_id);
+            }
+        }
+        self.request(Op::OpenChat(view.chat_id));
+        self.store.retry_failed_gaps(Some(view.chat_id));
         self.msgs = MessagesState::default();
         self.composer.clear();
+        if let Some(d) = self.drafts.remove(&view) {
+            self.composer.restore(d);
+        }
         self.load_history(view);
         if self.store.is_forum(view.chat_id) && view.topic.is_none() {
             self.load_topics(view.chat_id);
@@ -978,10 +1354,29 @@ impl App {
             }
             MessagesAction::Delete => {
                 if let Some(m) = self.selected_message() {
+                    let (chat_id, message_id) = (m.chat_id, m.id);
                     self.modal = Modal::ConfirmDelete {
-                        chat_id: m.chat_id,
-                        message_id: m.id,
+                        chat_id,
+                        message_id,
+                        rights: None,
                     };
+                    let tg = self.tg.clone();
+                    let tx = self.tx.clone();
+                    tokio::spawn(async move {
+                        let result = tg
+                            .delete_rights(chat_id, message_id)
+                            .await
+                            .map(|(for_everyone, only_for_self)| DeleteRights {
+                                for_everyone,
+                                only_for_self,
+                            })
+                            .map_err(|e| format!("{e:#}"));
+                        let _ = tx.send(AppEvent::DeleteRights {
+                            chat_id,
+                            message_id,
+                            result,
+                        });
+                    });
                 }
             }
             MessagesAction::Open => self.attachment(None),
@@ -1028,18 +1423,42 @@ impl App {
         if !m.is_outgoing {
             return self.set_status("can only edit your own messages");
         }
-        let text = match &m.content {
+        let original = match &m.content {
             MessageContent::MessageText(t) => t.text.clone(),
             _ => return self.set_status("only text messages can be edited"),
         };
-        let md = if self.cfg.markdown.enabled {
-            to_markdown(&text)
-        } else {
-            text.text
-        };
-        self.composer.set_text(&md);
+        self.composer.clear();
         self.composer.mode = Mode::Edit(id);
         self.focus = Focus::Composer;
+        let formatting = composer::formatting_names(&original);
+        if formatting.is_empty() || !self.cfg.markdown.enabled {
+            // Plain text is edited as is: markdown parsing could turn
+            // `__init__` into italics.
+            self.composer.set_text(&original.text);
+            self.composer.edit = Some(EditOrigin {
+                initial: original.text.clone(),
+                original,
+                lossy: formatting,
+                warned: false,
+            });
+            return;
+        }
+        // Formatted text: TDLib writes the markdown; it fills the composer
+        // when it answers (a local call, so right away).
+        let tg = self.tg.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = tg
+                .markdown_of(original.clone())
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(AppEvent::EditReady {
+                view,
+                message_id: id,
+                original,
+                result,
+            });
+        });
     }
 
     /// Open (`dest` None) or save the selected message's file.
@@ -1054,9 +1473,10 @@ impl App {
                 .iter()
                 .max_by_key(|s| s.width)
                 .map(|s| (s.photo.clone(), format!("photo_{}.jpg", m.id))),
-            MessageContent::MessageDocument(d) => {
-                Some((d.document.document.clone(), d.document.file_name.clone()))
-            }
+            MessageContent::MessageDocument(d) => Some((
+                d.document.document.clone(),
+                non_empty(&d.document.file_name, format!("file_{}", m.id)),
+            )),
             MessageContent::MessageVideo(v) => Some((
                 v.video.video.clone(),
                 non_empty(&v.video.file_name, format!("video_{}.mp4", m.id)),
@@ -1081,21 +1501,41 @@ impl App {
             }
             _ => None,
         };
+        let fallback = format!("file_{}", m.id);
         let Some((file, name)) = file else {
             return self.set_status("no attachment");
         };
         let purpose = match dest {
             None => FilePurpose::Open,
-            Some(dir) => FilePurpose::Save(dir.join(sanitize(&name))),
+            Some(dir) => FilePurpose::Save(dir.join(sanitize(&name, &fallback))),
         };
         self.set_status("downloading…");
         self.spawn_download(file.id, purpose, 32);
     }
 
     fn yank(&mut self, text: String) {
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+        if self.clipboard.is_none() {
+            match arboard::Clipboard::new() {
+                Ok(c) => self.clipboard = Some(c),
+                Err(e) => tracing::debug!("clipboard: {e}"),
+            }
+        }
+        let result = match &mut self.clipboard {
+            Some(c) => c.set_text(text.clone()).map_err(|e| e.to_string()),
+            None => Err("no system clipboard".into()),
+        };
+        match result {
             Ok(()) => self.set_status("copied"),
-            Err(e) => self.set_status(format!("clipboard: {e}")),
+            Err(e) => {
+                // Over SSH or without a display: ask the terminal to copy.
+                self.clipboard = None;
+                tracing::debug!("clipboard: {e}; using OSC 52");
+                use std::io::Write;
+                let mut out = std::io::stdout();
+                let _ = out.write_all(osc52(&text).as_bytes());
+                let _ = out.flush();
+                self.set_status("copied through the terminal (OSC 52)");
+            }
         }
     }
 
@@ -1129,7 +1569,8 @@ impl App {
                         .view_messages(view)
                         .iter()
                         .rev()
-                        .find(|m| m.is_outgoing)
+                        // A message still being sent has a temporary id.
+                        .find(|m| m.is_outgoing && m.sending_state.is_none())
                         .map(|m| m.id);
                     if let Some(id) = last {
                         self.start_edit(id);
@@ -1171,25 +1612,60 @@ impl App {
         if text.trim().is_empty() {
             return;
         }
-        let mode = self.composer.mode;
+        let markdown = self.cfg.markdown.enabled;
+        let typed = Body::Typed {
+            text: text.clone(),
+            markdown,
+        };
+        let op = match self.composer.mode {
+            Mode::Edit(message_id) => {
+                let body = match self.composer.edit.as_mut() {
+                    Some(origin) if text == origin.initial => {
+                        self.composer.clear();
+                        return self.set_status("no changes");
+                    }
+                    Some(origin) if !origin.lossy.is_empty() && !origin.warned => {
+                        origin.warned = true;
+                        let what = origin.lossy.join(", ");
+                        let key = self.keys.composer.label(ComposerAction::Send);
+                        return self.set_status(format!(
+                            "saving this edit removes its {what}; {key} again to save"
+                        ));
+                    }
+                    // A message without formatting stays plain: no markdown parsing.
+                    Some(origin) if composer::formatting_names(&origin.original).is_empty() => {
+                        Body::Exact(tdlib_rs::types::FormattedText {
+                            text,
+                            entities: vec![],
+                        })
+                    }
+                    _ => typed,
+                };
+                Op::Edit {
+                    view,
+                    message_id,
+                    body,
+                    draft: self.composer.draft(),
+                }
+            }
+            Mode::Reply(id) => Op::Send {
+                view,
+                reply_to: Some(id),
+                body: typed,
+                draft: self.composer.draft(),
+            },
+            Mode::Normal => Op::Send {
+                view,
+                reply_to: None,
+                body: typed,
+                draft: self.composer.draft(),
+            },
+        };
+        self.request(op);
         self.composer.clear();
         self.composer.last_typing_sent = None;
         self.msgs.selected = None;
         self.msgs.scroll = 0;
-        let tg = self.tg.clone();
-        let tx = self.tx.clone();
-        let markdown = self.cfg.markdown.enabled;
-        tokio::spawn(async move {
-            let formatted = tg.formatted(text, markdown).await;
-            let res = match mode {
-                Mode::Edit(id) => tg.edit_text(view.chat_id, id, formatted).await,
-                Mode::Reply(id) => tg.send_text(view, Some(id), formatted).await,
-                Mode::Normal => tg.send_text(view, None, formatted).await,
-            };
-            if let Err(e) = res {
-                let _ = tx.send(AppEvent::Status(format!("send failed: {e:#}")));
-            }
-        });
     }
 
     /// Text currently in the composer, for `$EDITOR`.
@@ -1246,11 +1722,22 @@ impl App {
     }
 
     fn reveal_in_tree(&mut self, v: View) {
+        // Prefer All chats, then Archive, then any folder.
         let list = self
             .store
             .chats
             .get(&v.chat_id)
-            .and_then(|c| c.positions.first().map(|p| ListKey::from_list(&p.list)))
+            .and_then(|c| {
+                let lists: Vec<ListKey> = c
+                    .positions
+                    .iter()
+                    .map(|p| ListKey::from_list(&p.list))
+                    .collect();
+                [ListKey::Main, ListKey::Archive]
+                    .into_iter()
+                    .find(|l| lists.contains(l))
+                    .or_else(|| lists.first().copied())
+            })
             .unwrap_or(ListKey::Main);
         self.tree.expanded.insert(NodeId::List(list));
         let node = match v.topic {
@@ -1409,11 +1896,8 @@ fn non_empty(s: &str, fallback: String) -> String {
     }
 }
 
-/// `dir/name.ext`, or `dir/name (1).ext` and so on if it exists.
-fn unique_path(p: &std::path::Path) -> PathBuf {
-    if !p.exists() {
-        return p.to_path_buf();
-    }
+/// `dir/name.ext`, then `dir/name (1).ext`, `dir/name (2).ext` and so on.
+fn path_candidates(p: &std::path::Path) -> impl Iterator<Item = PathBuf> + '_ {
     let stem = p
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -1423,93 +1907,342 @@ fn unique_path(p: &std::path::Path) -> PathBuf {
         .map(|e| format!(".{}", e.to_string_lossy()))
         .unwrap_or_default();
     let dir = p.parent().map(|d| d.to_path_buf()).unwrap_or_default();
-    (1..)
-        .map(|n| dir.join(format!("{stem} ({n}){ext}")))
+    std::iter::once(p.to_path_buf())
+        .chain((1..).map(move |n| dir.join(format!("{stem} ({n}){ext}"))))
+}
+
+/// The first candidate of `p` that does not exist yet.
+#[cfg(test)]
+fn unique_path(p: &std::path::Path) -> PathBuf {
+    path_candidates(p)
         .find(|c| !c.exists())
         .expect("some free name")
 }
 
-fn sanitize(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c == '/' || c == '\\' || c == '\0' {
-                '_'
-            } else {
-                c
+/// Copies `src` to the first free name for `dest`, never overwriting a file
+/// (two saves of the same name at once each get their own). Returns the path.
+fn copy_unique(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<PathBuf> {
+    let mut input = std::fs::File::open(src)?;
+    for c in path_candidates(dest) {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&c)
+        {
+            Ok(mut out) => {
+                if let Err(e) = std::io::copy(&mut input, &mut out) {
+                    let _ = std::fs::remove_file(&c);
+                    return Err(e);
+                }
+                return Ok(c);
             }
-        })
-        .collect()
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("candidates never run out")
+}
+
+/// OSC 52 "set clipboard" sequence, which most terminals (and tmux with
+/// `set-clipboard on`) turn into a system copy.
+fn osc52(text: &str) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(text);
+    format!("\x1b]52;c;{b64}\x07")
+}
+
+/// A file name that stays inside its directory: no separators or control
+/// characters, and never empty, `.` or `..` (those become `fallback`).
+fn sanitize(name: &str, fallback: &str) -> String {
+    let clean: String = name
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| if c == '/' || c == '\\' { '_' } else { c })
+        .collect();
+    match clean.trim() {
+        "" | "." | ".." => fallback.to_string(),
+        _ => clean,
+    }
+}
+
+/// Name of an authorization state, without its payload.
+fn auth_state_name(s: &AuthorizationState) -> &'static str {
+    match s {
+        AuthorizationState::WaitTdlibParameters => "wait_tdlib_parameters",
+        AuthorizationState::WaitPhoneNumber => "wait_phone_number",
+        AuthorizationState::WaitOtherDeviceConfirmation(_) => "wait_other_device_confirmation",
+        AuthorizationState::WaitCode(_) => "wait_code",
+        AuthorizationState::WaitPassword(_) => "wait_password",
+        AuthorizationState::WaitEmailAddress(_) => "wait_email_address",
+        AuthorizationState::WaitEmailCode(_) => "wait_email_code",
+        AuthorizationState::WaitRegistration(_) => "wait_registration",
+        AuthorizationState::WaitPremiumPurchase(_) => "wait_premium_purchase",
+        AuthorizationState::Ready => "ready",
+        AuthorizationState::LoggingOut => "logging_out",
+        AuthorizationState::Closing => "closing",
+        AuthorizationState::Closed => "closed",
+    }
+}
+
+/// Extensions of files that can run code when opened, modelled on Telegram
+/// Desktop's list of executable extensions, plus macOS and Linux launchers.
+const RISKY_EXTENSIONS: &[&str] = &[
+    // Windows
+    "ad",
+    "ade",
+    "adp",
+    "app",
+    "application",
+    "appref-ms",
+    "asp",
+    "asx",
+    "bas",
+    "bat",
+    "bin",
+    "cer",
+    "chm",
+    "cmd",
+    "cnt",
+    "com",
+    "cpl",
+    "crt",
+    "csh",
+    "der",
+    "diagcab",
+    "dll",
+    "drv",
+    "exe",
+    "fxp",
+    "gadget",
+    "grp",
+    "hlp",
+    "hpj",
+    "hta",
+    "htt",
+    "inf",
+    "ini",
+    "ins",
+    "inx",
+    "isp",
+    "isu",
+    "its",
+    "jar",
+    "jnlp",
+    "job",
+    "js",
+    "jse",
+    "ksh",
+    "lnk",
+    "mad",
+    "maf",
+    "mag",
+    "mam",
+    "maq",
+    "mar",
+    "mas",
+    "mat",
+    "mau",
+    "mav",
+    "maw",
+    "mcf",
+    "mda",
+    "mdb",
+    "mde",
+    "mdt",
+    "mdw",
+    "mdz",
+    "mht",
+    "mhtml",
+    "mjs",
+    "mmc",
+    "mof",
+    "msc",
+    "msh",
+    "msh1",
+    "msh2",
+    "mshxml",
+    "msi",
+    "msp",
+    "mst",
+    "ops",
+    "osd",
+    "pcd",
+    "pif",
+    "plg",
+    "prf",
+    "prg",
+    "ps1",
+    "ps1xml",
+    "ps2",
+    "ps2xml",
+    "psc1",
+    "psc2",
+    "psd1",
+    "psm1",
+    "pst",
+    "reg",
+    "rgs",
+    "scf",
+    "scr",
+    "sct",
+    "search-ms",
+    "settingcontent-ms",
+    "shb",
+    "shs",
+    "slk",
+    "sys",
+    "u3p",
+    "url",
+    "vb",
+    "vbe",
+    "vbp",
+    "vbs",
+    "vbscript",
+    "vsmacros",
+    "vsw",
+    "ws",
+    "wsc",
+    "wsf",
+    "wsh",
+    "xbap",
+    "xll",
+    "xnk",
+    // Scripts
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "py",
+    "pyc",
+    "pyo",
+    "pyw",
+    "pyz",
+    "pl",
+    "pm",
+    "rb",
+    "php",
+    "phar",
+    "lua",
+    "tcl",
+    "ps",
+    "applescript",
+    "scpt",
+    "scptd",
+    // macOS
+    "action",
+    "command",
+    "dmg",
+    "fileloc",
+    "inetloc",
+    "kext",
+    "mpkg",
+    "pkg",
+    "prefpane",
+    "saver",
+    "terminal",
+    "tool",
+    "webloc",
+    "workflow",
+    // Linux
+    "appimage",
+    "deb",
+    "desktop",
+    "flatpakref",
+    "rpm",
+    "run",
+    "snap",
+    // Pages a browser runs with access to local files
+    "htm",
+    "html",
+    "shtml",
+    "svg",
+    "xht",
+    "xhtml",
+];
+
+/// Whether opening `path` with the system handler can run code: a risky
+/// extension, or the executable bit.
+fn can_run_code(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let risky_ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .is_some_and(|e| RISKY_EXTENSIONS.contains(&e.as_str()));
+    let executable = std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0);
+    risky_ext || executable
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Paths `open_path` would have opened.
+    static OPENED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn open_path(path: &str) {
-    let opener = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    if let Err(e) = std::process::Command::new(opener)
-        .arg(path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
+    #[cfg(test)]
     {
-        tracing::warn!("{opener}: {e}");
+        OPENED.with(|o| o.borrow_mut().push(path.to_string()));
+    }
+    #[cfg(not(test))]
+    {
+        quarantine(path);
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        match std::process::Command::new(opener)
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            // Reap the child so it does not linger as a zombie.
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+            Err(e) => tracing::warn!("{opener}: {e}"),
+        }
     }
 }
 
-/// Re-creates editable markdown from entities (inverse of TDLib `parseMarkdown`).
-pub fn to_markdown(ft: &tdlib_rs::types::FormattedText) -> String {
-    use tdlib_rs::enums::TextEntityType as T;
-    let units: Vec<u16> = ft.text.encode_utf16().collect();
-    // (utf16 position, is_close, marker) inserts.
-    let mut marks: Vec<(usize, bool, String)> = Vec::new();
-    for e in &ft.entities {
-        let (open, close) = match &e.r#type {
-            T::Bold => ("**".to_string(), "**".to_string()),
-            T::Italic => ("__".into(), "__".into()),
-            T::Strikethrough => ("~~".into(), "~~".into()),
-            T::Spoiler => ("||".into(), "||".into()),
-            T::Code => ("`".into(), "`".into()),
-            T::Pre | T::PreCode(_) => {
-                let lang = if let T::PreCode(p) = &e.r#type {
-                    p.language.clone()
-                } else {
-                    String::new()
-                };
-                // TDLib keeps the block's trailing newline inside the entity.
-                let end = (e.offset + e.length).max(0) as usize;
-                let ends_nl = end > 0 && units.get(end - 1) == Some(&(b'\n' as u16));
-                (
-                    format!("```{lang}\n"),
-                    if ends_nl {
-                        "```".into()
-                    } else {
-                        "\n```".into()
-                    },
-                )
-            }
-            T::TextUrl(u) => ("[".into(), format!("]({})", u.url)),
-            _ => continue,
-        };
-        let a = e.offset.max(0) as usize;
-        let b = (e.offset + e.length).max(0) as usize;
-        marks.push((a, false, open));
-        marks.push((b, true, close));
+/// Marks a downloaded file the way browsers do, so Gatekeeper checks it on
+/// first open. Keeps an existing mark.
+#[cfg(all(target_os = "macos", not(test)))]
+fn quarantine(path: &str) {
+    let Ok(cpath) = std::ffi::CString::new(path) else {
+        return;
+    };
+    let name = c"com.apple.quarantine";
+    // SAFETY: valid C strings; a null buffer only asks for the size.
+    unsafe {
+        if libc::getxattr(cpath.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0, 0, 0) >= 0 {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let value = format!("0081;{now:08x};telegordo;");
+        if libc::setxattr(
+            cpath.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        ) != 0
+        {
+            tracing::warn!("quarantine {path}: {}", std::io::Error::last_os_error());
+        }
     }
-    // Closes before opens at the same spot; later opens close first.
-    marks.sort_by(|x, y| x.0.cmp(&y.0).then(y.1.cmp(&x.1)));
-    let mut out = String::new();
-    let mut last = 0;
-    for (pos, _, mark) in marks {
-        let pos = pos.min(units.len());
-        out.push_str(&String::from_utf16_lossy(&units[last..pos]));
-        out.push_str(&mark);
-        last = pos;
-    }
-    out.push_str(&String::from_utf16_lossy(&units[last..]));
-    out
 }
+
+#[cfg(all(not(target_os = "macos"), not(test)))]
+fn quarantine(_path: &str) {}
 
 #[cfg(test)]
 mod tests {
@@ -1621,7 +2354,7 @@ mod tests {
 
     #[tokio::test]
     async fn composer_up_edits_last_own_message_and_esc_cancels() {
-        let (mut app, _rx) = testutil::app(Images::disabled(), true);
+        let (mut app, mut rx) = testutil::app(Images::disabled(), true);
         app.current = Some(View {
             chat_id: 10,
             topic: None,
@@ -1629,6 +2362,9 @@ mod tests {
         app.focus = Focus::Composer;
         app.on_key(key(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.composer.mode, Mode::Edit(102));
+        // Formatted: TDLib writes the markdown.
+        let ev = wait_for(&mut rx, |e| matches!(e, AppEvent::EditReady { .. })).await;
+        app.on_app_event(ev);
         assert_eq!(app.composer.text(), "**Great** thanks");
         app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.composer.mode, Mode::Normal);
@@ -1673,7 +2409,8 @@ mod tests {
             app.modal,
             Modal::ConfirmDelete {
                 chat_id: 10,
-                message_id: 100
+                message_id: 100,
+                ..
             }
         ));
         app.on_key(ch('n'));
@@ -1730,7 +2467,10 @@ mod tests {
         .await
         .expect("image encoded");
         app.on_app_event(ev);
-        assert!(matches!(app.images.entries.get(&77), Some(Entry::Ready(_))));
+        assert!(matches!(
+            app.images.entries.get(&77),
+            Some(Entry::Ready { .. })
+        ));
         let after = render(&mut app, 90, 30);
         println!("{after}");
         assert!(
@@ -1764,29 +2504,779 @@ mod tests {
             );
         }
         assert!(f.text.starts_with("b i s p c t"));
-        // Editing round-trip: our markdown parses back to the same entities.
-        let again = tg.formatted(to_markdown(&f), true).await;
+        // Editing round-trip: the markdown TDLib writes parses back to the same entities.
+        let md = tg.markdown_of(f.clone()).await.unwrap();
+        assert!(md.entities.is_empty(), "all of it is markdown: {md:?}");
+        let again = tg.formatted(md.text, true).await;
         assert_eq!(again.text, f.text);
         assert_eq!(again.entities, f.entities);
     }
 
-    #[test]
-    fn markdown_round_trip_for_editing() {
-        let ft = FormattedText {
-            text: "hi bold and 😀code".into(),
-            entities: vec![
-                TextEntity {
-                    offset: 3,
-                    length: 4,
-                    r#type: TextEntityType::Bold,
-                },
-                TextEntity {
-                    offset: 14,
-                    length: 4,
-                    r#type: TextEntityType::Code,
-                },
-            ],
+    fn entity(offset: i32, length: i32, r#type: TextEntityType) -> TextEntity {
+        TextEntity {
+            offset,
+            length,
+            r#type,
+        }
+    }
+
+    fn own_text_message(id: i64, text: FormattedText) -> Message {
+        let content = serde_json::json!({"@type": "messageText", "text": text,
+            "link_preview": null, "link_preview_options": null});
+        testutil::message(id, 10, 1, BASE_DATE + 200, content, None)
+    }
+
+    async fn wait_for(
+        rx: &mut UnboundedReceiver<AppEvent>,
+        want: impl Fn(&AppEvent) -> bool,
+    ) -> AppEvent {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match rx.recv().await {
+                    Some(e) if want(&e) => break e,
+                    Some(_) => continue,
+                    None => panic!("channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("event in time")
+    }
+
+    fn enter() -> KeyEvent {
+        key(KeyCode::Enter, KeyModifiers::NONE)
+    }
+
+    fn type_str(app: &mut App, s: &str) {
+        for c in s.chars() {
+            app.on_key(ch(c));
+        }
+    }
+
+    #[tokio::test]
+    async fn sends_queue_in_order_and_a_failure_refills_the_composer() {
+        let (mut app, _rx) = testutil::app(Images::disabled(), true);
+        let mut ops = testutil::capture_outbox(&mut app);
+        app.current = Some(view(10, None));
+        app.focus = Focus::Composer;
+        type_str(&mut app, "one");
+        app.on_key(enter());
+        type_str(&mut app, "two");
+        app.on_key(enter());
+        let sent: Vec<String> = testutil::drain(&mut ops)
+            .into_iter()
+            .map(|op| match op {
+                Op::Send {
+                    body: Body::Typed { text, .. },
+                    ..
+                } => text,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(sent, vec!["one", "two"]);
+        assert!(app.composer.is_empty());
+
+        // Telegram refused the reply: the text and the reply mode come back.
+        let draft = Draft {
+            text: "too long".into(),
+            mode: Mode::Reply(100),
+            edit: None,
         };
-        assert_eq!(to_markdown(&ft), "hi **bold** and 😀`code`");
+        app.on_app_event(AppEvent::SendFailed {
+            view: view(10, None),
+            draft: draft.clone(),
+            error: "telegram error 400: MESSAGE_TOO_LONG".into(),
+        });
+        assert_eq!(app.composer.text(), "too long");
+        assert_eq!(app.composer.mode, Mode::Reply(100));
+        assert!(app.status.as_ref().unwrap().0.contains("MESSAGE_TOO_LONG"));
+
+        // Not over newer typing.
+        app.composer.set_text("newer");
+        app.on_app_event(AppEvent::SendFailed {
+            view: view(10, None),
+            draft,
+            error: "x".into(),
+        });
+        assert_eq!(app.composer.text(), "newer");
+    }
+
+    #[tokio::test]
+    async fn unchanged_edit_sends_nothing_and_plain_text_is_not_reparsed() {
+        let (mut app, _rx) = testutil::app(Images::disabled(), true);
+        let mut ops = testutil::capture_outbox(&mut app);
+        let plain = "see __init__.py, 2**10** and a_b__c";
+        app.store.insert_message(own_text_message(
+            103,
+            FormattedText {
+                text: plain.into(),
+                entities: vec![],
+            },
+        ));
+        app.current = Some(view(10, None));
+        app.focus = Focus::Composer;
+
+        app.on_key(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.composer.mode, Mode::Edit(103));
+        assert_eq!(app.composer.text(), plain, "plain text, as is");
+        app.on_key(enter());
+        assert!(testutil::drain(&mut ops).is_empty(), "no-op edit");
+        assert_eq!(app.composer.mode, Mode::Normal);
+
+        app.on_key(key(KeyCode::Up, KeyModifiers::NONE));
+        app.on_key(key(KeyCode::End, KeyModifiers::NONE));
+        app.on_key(ch('!'));
+        app.on_key(enter());
+        let ops = testutil::drain(&mut ops);
+        let [
+            Op::Edit {
+                message_id: 103,
+                body,
+                ..
+            },
+        ] = ops.as_slice()
+        else {
+            panic!("expected one edit, got {ops:?}");
+        };
+        let sent = body.clone().resolve(&testutil::shared_tg()).await;
+        assert_eq!(sent.text, format!("{plain}!"));
+        assert!(sent.entities.is_empty());
+        // What the old path did: markdown parsing changes the text.
+        let reparsed = Body::Typed {
+            text: format!("{plain}!"),
+            markdown: true,
+        }
+        .resolve(&testutil::shared_tg())
+        .await;
+        assert_ne!(reparsed.text, sent.text);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn formatted_edit_uses_tdlib_markdown_and_warns_before_dropping_formatting() {
+        let (mut app, mut rx) = testutil::app(Images::disabled(), true);
+        let mut ops = testutil::capture_outbox(&mut app);
+        // "hi Bob, look": Bob is a mention without a username, "look" underlined, "hi" bold.
+        app.store.insert_message(own_text_message(
+            103,
+            FormattedText {
+                text: "hi Bob, look".into(),
+                entities: vec![
+                    entity(0, 2, TextEntityType::Bold),
+                    entity(
+                        3,
+                        3,
+                        TextEntityType::MentionName(tdlib_rs::types::TextEntityTypeMentionName {
+                            user_id: 42,
+                        }),
+                    ),
+                    entity(8, 4, TextEntityType::Underline),
+                ],
+            },
+        ));
+        app.current = Some(view(10, None));
+        app.focus = Focus::Composer;
+        app.on_key(key(KeyCode::Up, KeyModifiers::NONE));
+        let ev = wait_for(&mut rx, |e| matches!(e, AppEvent::EditReady { .. })).await;
+        app.on_app_event(ev);
+        assert_eq!(app.composer.text(), "**hi** Bob, look");
+        let lossy = &app.composer.edit.as_ref().unwrap().lossy;
+        assert!(lossy.contains(&"mentions") && lossy.contains(&"underline"));
+
+        app.on_key(key(KeyCode::End, KeyModifiers::NONE));
+        app.on_key(ch('!'));
+        app.on_key(enter());
+        assert!(
+            testutil::drain(&mut ops).is_empty(),
+            "first enter only warns"
+        );
+        let status = app.status.as_ref().unwrap().0.clone();
+        assert!(status.contains("mentions, underline"), "{status}");
+        assert_eq!(app.composer.text(), "**hi** Bob, look!");
+        app.on_key(enter());
+        let ops = testutil::drain(&mut ops);
+        assert!(
+            matches!(
+                ops.as_slice(),
+                [Op::Edit { body: Body::Typed { text, markdown: true }, .. }]
+                    if text == "**hi** Bob, look!"
+            ),
+            "{ops:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_a_file_that_can_run_code_asks_first() {
+        let dir = std::env::temp_dir().join(format!("telegordo-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (jar, pdf, exe) = (dir.join("x.jar"), dir.join("x.pdf"), dir.join("tool"));
+        for p in [&jar, &pdf, &exe] {
+            std::fs::write(p, "x").unwrap();
+        }
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(can_run_code(&jar) && can_run_code(&exe));
+        assert!(can_run_code(std::path::Path::new("Report.PDF.Command")));
+        assert!(!can_run_code(&pdf));
+
+        let (mut app, _rx) = testutil::app(Images::disabled(), true);
+        let opened = || OPENED.with(|o| std::mem::take(&mut *o.borrow_mut()));
+        let open = |app: &mut App, p: &std::path::Path| {
+            let p = p.to_string_lossy();
+            app.on_app_event(AppEvent::File {
+                purpose: FilePurpose::Open,
+                result: Ok(testutil::file(5, &p, true)),
+            });
+        };
+        open(&mut app, &pdf);
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(opened(), vec![pdf.to_string_lossy().to_string()]);
+
+        open(&mut app, &jar);
+        assert!(matches!(app.modal, Modal::ConfirmOpen { .. }));
+        assert!(render(&mut app, 90, 20).contains("x.jar can run code. Open anyway? y / N"));
+        app.on_key(enter());
+        assert!(matches!(app.modal, Modal::None));
+        assert!(opened().is_empty(), "enter cancels");
+        open(&mut app, &jar);
+        app.on_key(ch('y'));
+        assert_eq!(opened(), vec![jar.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn view(chat_id: i64, topic: Option<i32>) -> View {
+        View { chat_id, topic }
+    }
+
+    #[tokio::test]
+    async fn ctrl_d_asks_before_logging_out() {
+        let (mut app, _rx) = testutil::app(Images::disabled(), true);
+        let mut ops = testutil::capture_outbox(&mut app);
+        app.current = Some(view(10, None));
+        app.focus = Focus::Composer;
+        let ctrl_d = key(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        for cancel in [
+            ch('n'),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            key(KeyCode::Esc, KeyModifiers::NONE),
+            ch('x'),
+        ] {
+            app.on_key(ctrl_d);
+            assert!(matches!(app.modal, Modal::ConfirmLogout), "composer focus");
+            assert!(!app.logging_out);
+            app.on_key(cancel);
+            assert!(matches!(app.modal, Modal::None), "{cancel:?} cancels");
+            assert!(!app.logging_out);
+        }
+        assert!(app.composer.is_empty(), "the modal took the keys");
+        assert!(testutil::drain(&mut ops).is_empty());
+
+        app.on_key(ctrl_d);
+        let s = render(&mut app, 90, 20);
+        assert!(s.contains("Log out of Telegram and delete the local session? y / N"));
+        app.on_key(ch('y'));
+        assert!(app.logging_out);
+        assert_eq!(testutil::drain(&mut ops), vec![Op::LogOut]);
+        app.on_key(ctrl_d);
+        assert!(matches!(app.modal, Modal::None), "no second logout");
+        assert!(testutil::drain(&mut ops).is_empty());
+    }
+
+    fn new_message_in_topic(id: i64, topic: i32) -> Update {
+        let mut m = testutil::message(
+            id,
+            10,
+            2,
+            BASE_DATE + 500,
+            testutil::text_content("hey there"),
+            None,
+        );
+        m.topic_id = Some(enums::MessageTopic::Forum(
+            tdlib_rs::types::MessageTopicForum {
+                forum_topic_id: topic,
+            },
+        ));
+        Update::NewMessage(tdlib_rs::types::UpdateNewMessage { message: m })
+    }
+
+    #[tokio::test]
+    async fn only_messages_of_the_open_topic_are_marked_read() {
+        let (mut app, _rx) = testutil::app(Images::disabled(), true);
+        let mut ops = testutil::capture_outbox(&mut app);
+        app.current = Some(view(10, Some(5)));
+        app.on_update(new_message_in_topic(200, 6));
+        assert!(
+            testutil::drain(&mut ops).is_empty(),
+            "a message in another topic stays unread"
+        );
+        app.on_update(new_message_in_topic(201, 5));
+        assert_eq!(
+            testutil::drain(&mut ops),
+            vec![Op::ViewMessages {
+                chat_id: 10,
+                ids: vec![201]
+            }]
+        );
+        // The whole-chat view shows every topic.
+        app.current = Some(view(10, None));
+        app.on_update(new_message_in_topic(202, 6));
+        assert_eq!(testutil::drain(&mut ops).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_says_for_whom_and_enter_never_confirms() {
+        let (mut app, _rx) = testutil::app(Images::disabled(), true);
+        let mut ops = testutil::capture_outbox(&mut app);
+        app.current = Some(view(10, None));
+        app.focus = Focus::Messages;
+        app.msgs.selected = Some(101);
+        let rights = |app: &mut App, for_everyone, only_for_self| {
+            app.on_app_event(AppEvent::DeleteRights {
+                chat_id: 10,
+                message_id: 101,
+                result: Ok(DeleteRights {
+                    for_everyone,
+                    only_for_self,
+                }),
+            })
+        };
+        let delete = |revoke| Op::Delete {
+            chat_id: 10,
+            message_id: 101,
+            revoke,
+        };
+
+        app.on_key(ch('d'));
+        app.on_key(ch('y'));
+        assert!(
+            matches!(app.modal, Modal::ConfirmDelete { rights: None, .. }),
+            "y waits until TDLib says what is allowed"
+        );
+        rights(&mut app, true, true);
+        let s = render(&mut app, 90, 20);
+        assert!(
+            s.contains("Delete for everyone? y / N · m: only for me"),
+            "{s}"
+        );
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.modal, Modal::None), "enter cancels");
+        assert!(testutil::drain(&mut ops).is_empty());
+
+        app.on_key(ch('d'));
+        rights(&mut app, true, true);
+        app.on_key(ch('m'));
+        assert_eq!(testutil::drain(&mut ops), vec![delete(false)]);
+
+        app.on_key(ch('d'));
+        rights(&mut app, true, true);
+        app.on_key(ch('y'));
+        assert_eq!(testutil::drain(&mut ops), vec![delete(true)]);
+
+        app.on_key(ch('d'));
+        rights(&mut app, false, true);
+        assert!(render(&mut app, 90, 20).contains("Delete for me? y / N"));
+        app.on_key(ch('y'));
+        assert_eq!(testutil::drain(&mut ops), vec![delete(false)]);
+    }
+
+    #[test]
+    fn file_names_stay_inside_the_download_dir() {
+        assert_eq!(sanitize("", "file_7"), "file_7");
+        assert_eq!(sanitize(".", "file_7"), "file_7");
+        assert_eq!(sanitize("..", "file_7"), "file_7");
+        assert_eq!(sanitize("a/b", "file_7"), "a_b");
+        assert_eq!(sanitize("../../x", "f"), ".._.._x");
+        assert_eq!(sanitize("a\u{1b}b\n", "f"), "ab");
+        let dir = std::env::temp_dir().join(format!("telegordo-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["", "..", "a/b"] {
+            let p = unique_path(&dir.join(sanitize(name, "file_7")));
+            assert_eq!(p.parent(), Some(dir.as_path()), "{name:?} gave {p:?}");
+            std::fs::write(&p, "x").unwrap();
+        }
+        // "" and ".." both became file_7; the second got a number.
+        assert!(dir.join("file_7").exists() && dir.join("file_7 (1)").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auth_state_is_logged_without_its_payload() {
+        let s: AuthorizationState = serde_json::from_value(serde_json::json!({
+            "@type": "authorizationStateWaitPassword",
+            "password_hint": "my 4711 hint",
+            "has_recovery_email_address": true,
+            "has_passport_data": false,
+            "recovery_email_address_pattern": "a***@example.com",
+        }))
+        .unwrap();
+        let name = auth_state_name(&s);
+        assert_eq!(name, "wait_password");
+        assert!(!name.contains("4711") && !name.contains("example"));
+    }
+
+    fn texts(ids: std::ops::RangeInclusive<i64>) -> Vec<Message> {
+        ids.map(|id| {
+            testutil::message(
+                id,
+                10,
+                2,
+                BASE_DATE + 60,
+                testutil::text_content(&format!("msg {id}")),
+                None,
+            )
+        })
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn jumping_far_back_marks_the_gap_and_loads_it_from_the_newer_side() {
+        let (mut app, mut rx) = testutil::app(Images::disabled(), true);
+        app.current = Some(view(10, None));
+        // The newest messages (100..=102) are loaded; the reply target 50 is not.
+        app.on_app_event(AppEvent::Around {
+            view: view(10, None),
+            target: 50,
+            result: Ok(texts(45..=55)),
+        });
+        assert_eq!(app.msgs.selected, Some(50));
+        assert_eq!(app.store.gaps_of(10), vec![(55, 100)]);
+        // Show the bottom, where the marker sits above the newer block.
+        app.msgs.selected = None;
+        app.msgs.scroll = 0;
+        let s = render(&mut app, 100, 30);
+        assert!(s.contains("older messages not loaded"), "{s}");
+        assert_eq!(app.wanted_gaps, vec![100]);
+
+        app.after_draw();
+        assert!(app.store.gap_mut(10, 100).unwrap().loading);
+        let ev = wait_for(&mut rx, |e| matches!(e, AppEvent::GapPage { .. })).await;
+        let AppEvent::GapPage { newer_end, .. } = &ev else {
+            unreachable!()
+        };
+        assert_eq!(*newer_end, 100, "pages backwards from the newer side");
+
+        // TDLib answers with part of the hole, then with the rest.
+        app.on_app_event(AppEvent::GapPage {
+            chat_id: 10,
+            newer_end: 100,
+            result: Ok(texts(80..=99)),
+        });
+        assert_eq!(app.store.gaps_of(10), vec![(55, 80)]);
+        app.on_app_event(AppEvent::GapPage {
+            chat_id: 10,
+            newer_end: 80,
+            result: Ok(texts(50..=79)),
+        });
+        assert!(app.store.gaps_of(10).is_empty());
+        assert!(!render(&mut app, 100, 30).contains("older messages not loaded"));
+    }
+
+    #[tokio::test]
+    async fn muted_scope_silences_default_chats() {
+        let (mut app, _rx) = testutil::app(Images::disabled(), true);
+        app.store.chats.get_mut(&10).unwrap().use_default_mute_for = true;
+        let m = app.store.message(10, 100).unwrap().clone();
+        assert!(!app.store.message_muted(&m));
+        app.on_app_event(AppEvent::ScopeMute {
+            scope: enums::NotificationSettingsScope::GroupChats,
+            mute_for: 3600,
+        });
+        assert!(app.store.message_muted(&m));
+        // The tree dims it and the folder badge stops counting it.
+        let rows = chats_tree::rows(&app.store, &app.tree);
+        let family = rows.iter().find(|r| r.label == "Family").unwrap();
+        assert!(family.muted);
+        assert_eq!(rows[0].unread, 0, "Family was the only unread unmuted chat");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn saving_copies_off_the_event_loop_and_reports_the_final_path() {
+        let dir = std::env::temp_dir().join(format!("telegordo-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.bin");
+        std::fs::write(&src, "payload").unwrap();
+        std::fs::write(dir.join("report.pdf"), "taken").unwrap();
+        let (mut app, mut rx) = testutil::app(Images::disabled(), true);
+        app.on_app_event(AppEvent::File {
+            purpose: FilePurpose::Save(dir.join("report.pdf")),
+            result: Ok(testutil::file(5, &src.to_string_lossy(), true)),
+        });
+        // The handler only queued the copy; the result comes back as an event.
+        let AppEvent::Status(s) = wait_for(&mut rx, |e| matches!(e, AppEvent::Status(_))).await
+        else {
+            unreachable!()
+        };
+        let saved = dir.join("report (1).pdf");
+        assert_eq!(s, format!("saved to {}", saved.display()));
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), "payload");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("report.pdf")).unwrap(),
+            "taken"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_new_image_size_requests_a_new_encode() {
+        use ratatui_image::picker::Picker;
+        let picker = Picker::halfblocks();
+        let encode = |picker: &Picker, cols, rows| {
+            picker
+                .new_protocol(
+                    ::image::DynamicImage::new_rgb8(16, 16),
+                    ratatui::layout::Size::new(cols, rows),
+                    ratatui_image::Resize::Fit(None),
+                )
+                .unwrap()
+        };
+        let proto = encode(&picker, 10, 5);
+        let resized = encode(&picker, 8, 4);
+        let images = Images {
+            picker: Some(picker),
+            max_cols: 40,
+            max_rows: 12,
+            entries: Default::default(),
+        };
+        let (mut app, _rx) = testutil::app(images, true);
+        app.store
+            .files
+            .insert(77, testutil::file(77, "/nonexistent.png", true));
+        app.images.entries.insert(
+            77,
+            Entry::Ready {
+                proto,
+                cols: 10,
+                rows: 5,
+                resizing: None,
+            },
+        );
+        let wanted = |cols, rows| Wanted {
+            file_id: 77,
+            cols,
+            rows,
+        };
+        app.wanted = vec![wanted(10, 5)];
+        app.after_draw();
+        assert!(
+            matches!(app.images.entries[&77], Entry::Ready { .. }),
+            "same size: kept"
+        );
+        app.wanted = vec![wanted(8, 4)];
+        app.after_draw();
+        assert!(matches!(
+            app.images.entries[&77],
+            Entry::Ready {
+                cols: 10,
+                rows: 5,
+                resizing: Some((8, 4)),
+                ..
+            }
+        ));
+        assert!(
+            app.images.protocol(77).is_some(),
+            "old image stays meanwhile"
+        );
+        app.wanted = vec![wanted(8, 4)];
+        app.after_draw();
+        assert!(
+            matches!(
+                app.images.entries[&77],
+                Entry::Ready {
+                    resizing: Some((8, 4)),
+                    ..
+                }
+            ),
+            "no second request for the same size"
+        );
+        // A late result for the old size does not replace the new request.
+        app.on_app_event(AppEvent::ImageReady {
+            wanted: wanted(10, 5),
+            result: Err("stale".into()),
+        });
+        assert!(matches!(
+            app.images.entries[&77],
+            Entry::Ready {
+                resizing: Some((8, 4)),
+                ..
+            }
+        ));
+        app.on_app_event(AppEvent::ImageReady {
+            wanted: wanted(8, 4),
+            result: Ok(resized),
+        });
+        assert!(matches!(
+            app.images.entries[&77],
+            Entry::Ready {
+                cols: 8,
+                rows: 4,
+                resizing: None,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn quit_closes_after_queued_sends_and_slow_ops_do_not_block() {
+        let (mut app, _rx) = testutil::app(Images::disabled(), true);
+        let mut ops = testutil::capture_outbox(&mut app);
+        app.current = Some(view(10, None));
+        app.focus = Focus::Composer;
+        type_str(&mut app, "bye");
+        app.on_key(enter());
+        app.on_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        let ops = testutil::drain(&mut ops);
+        assert!(
+            matches!(ops.as_slice(), [Op::Send { .. }, Op::Close]),
+            "{ops:?}"
+        );
+        // Edits, deletes and logout wait for the server, so they run apart.
+        assert!(!outbox::waits_for_server(&ops[0]));
+        assert!(!outbox::waits_for_server(&Op::Close));
+        assert!(outbox::waits_for_server(&Op::LogOut));
+        assert!(outbox::waits_for_server(&Op::Delete {
+            chat_id: 1,
+            message_id: 1,
+            revoke: true
+        }));
+    }
+
+    fn auth_state(name: &str) -> Update {
+        serde_json::from_value(serde_json::json!({
+            "@type": "updateAuthorizationState",
+            "authorization_state": {"@type": name},
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_failed_logout_keeps_the_session() {
+        let dir = std::env::temp_dir().join(format!("telegordo-logout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut app, _rx) = testutil::app(Images::disabled(), true);
+        app.params.database_dir = dir.clone();
+        app.params.key_store = crate::tg::KeyStore::File(dir.join("missing.key"));
+        app.on_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        app.on_key(ch('y'));
+        assert!(app.logging_out);
+        app.on_app_event(AppEvent::LogOutFailed("network".into()));
+        assert!(!app.logging_out, "logout can be tried again");
+        app.on_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(matches!(app.modal, Modal::ConfirmLogout));
+        app.on_key(ch('y'));
+        // Even with the flag set, a close Telegram did not start as a logout
+        // (no authorizationStateLoggingOut) keeps the database.
+        app.on_update(auth_state("authorizationStateClosed"));
+        assert!(dir.exists(), "session kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_failed_send_in_a_chat_left_behind_becomes_its_draft() {
+        let (mut app, _rx) = testutil::app(Images::disabled(), true);
+        app.open_view(view(12, None));
+        app.on_app_event(AppEvent::SendFailed {
+            view: view(10, None),
+            draft: Draft {
+                text: "lost?".into(),
+                mode: Mode::Normal,
+                edit: None,
+            },
+            error: "telegram error 403: CHAT_WRITE_FORBIDDEN".into(),
+        });
+        assert!(app.composer.is_empty(), "chat 12's composer untouched");
+        assert!(app.status.as_ref().unwrap().0.contains("draft"));
+        app.open_view(view(10, None));
+        assert_eq!(app.composer.text(), "lost?");
+    }
+
+    #[tokio::test]
+    async fn eviction_drops_encoded_images_of_forgotten_messages() {
+        let (mut app, _rx) = testutil::app(Images::disabled(), true);
+        app.store.insert_message(testutil::message(
+            103,
+            10,
+            2,
+            BASE_DATE + 120,
+            testutil::photo_content(77, "/x.png", 64, 48),
+            None,
+        ));
+        app.images
+            .entries
+            .insert(77, Entry::Requested { cols: 4, rows: 2 });
+        app.images
+            .entries
+            .insert(78, Entry::Requested { cols: 4, rows: 2 });
+        app.evict();
+        assert!(app.images.entries.contains_key(&77));
+        assert!(!app.images.entries.contains_key(&78), "no message uses 78");
+    }
+
+    #[tokio::test]
+    async fn a_failed_gap_load_is_retried_when_the_chat_is_reopened() {
+        let (mut app, _rx) = testutil::app(Images::disabled(), true);
+        app.store.insert_page(10, texts(45..=55), None);
+        app.store.gap_mut(10, 100).unwrap().failed = true;
+        app.open_view(view(10, None));
+        assert!(!app.store.gap_mut(10, 100).unwrap().failed);
+    }
+
+    #[tokio::test]
+    async fn background_chats_keep_a_bounded_cache() {
+        let (mut app, _rx) = testutil::app(Images::disabled(), true);
+        app.current = Some(view(12, None));
+        // Chat 10 was opened before; chat 11 never was.
+        app.store.history.insert(view(10, None), Default::default());
+        for id in 1000..1000 + KEEP_BACKGROUND as i64 + 100 {
+            for chat in [10, 11] {
+                let m =
+                    testutil::message(id, chat, 2, BASE_DATE, testutil::text_content("x"), None);
+                app.on_update(Update::NewMessage(tdlib_rs::types::UpdateNewMessage {
+                    message: m,
+                }));
+            }
+        }
+        assert_eq!(app.store.messages[&10].len(), KEEP_BACKGROUND);
+        assert_eq!(app.store.messages[&11].len(), KEEP_UNOPENED);
+        let newest = 1000 + KEEP_BACKGROUND as i64 + 99;
+        assert!(app.store.message(11, newest).is_some(), "keeps the newest");
+    }
+
+    #[test]
+    fn osc52_encodes_the_text() {
+        assert_eq!(osc52("hi"), "\x1b]52;c;aGk=\x07");
+    }
+
+    #[tokio::test]
+    async fn without_focus_events_other_chats_still_notify() {
+        let (mut app, _rx) = testutil::app(Images::disabled(), true);
+        app.current = Some(view(10, None));
+        let other = testutil::message(300, 12, 2, BASE_DATE, testutil::text_content("hi"), None);
+        // `would_notify` mirrors `maybe_notify`'s decision.
+        assert!(
+            app.would_notify(&other),
+            "no focus events: notify for other chats"
+        );
+        let open = app.store.message(10, 100).unwrap().clone();
+        assert!(!app.would_notify(&open), "but not for the open chat");
+        app.on_terminal(Event::FocusGained);
+        assert!(!app.would_notify(&other), "focused, when_unfocused = true");
+        app.on_terminal(Event::FocusLost);
+        assert!(app.would_notify(&other));
+    }
+
+    #[tokio::test]
+    async fn drafts_survive_switching_chats() {
+        let (mut app, _rx) = testutil::app(Images::disabled(), true);
+        app.open_view(view(10, None));
+        type_str(&mut app, "half typed");
+        app.open_view(view(12, None));
+        assert!(app.composer.is_empty());
+        app.open_view(view(10, None));
+        assert_eq!(app.composer.text(), "half typed");
     }
 }

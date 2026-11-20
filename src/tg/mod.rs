@@ -68,8 +68,8 @@ impl Tg {
         self.stop.store(true, Ordering::Relaxed);
     }
 
-    /// Sends TDLib's own log to a file and redirects stderr there too,
-    /// so nothing writes over the TUI.
+    /// Sends TDLib's own log to a file, so it does not write over the TUI.
+    /// stderr itself is left alone, so panic messages still reach the terminal.
     pub async fn setup_logging(&self, path: &Path, verbosity: i32) -> Result<()> {
         functions::set_log_verbosity_level(verbosity, self.client_id)
             .await
@@ -228,6 +228,16 @@ impl Tg {
         }
     }
 
+    /// Editable markdown for a message (TDLib's inverse of `parseMarkdown`).
+    /// Entities markdown cannot express stay in the result's `entities`.
+    pub async fn markdown_of(&self, text: types::FormattedText) -> Result<types::FormattedText> {
+        let enums::FormattedText::FormattedText(f) =
+            functions::get_markdown_text(text, self.client_id)
+                .await
+                .map_err(td_err)?;
+        Ok(f)
+    }
+
     pub async fn send_text(
         &self,
         view: View,
@@ -267,17 +277,32 @@ impl Tg {
         Ok(())
     }
 
-    /// Deletes for everyone when allowed, otherwise only for us.
-    pub async fn delete(&self, chat_id: i64, message_id: i64) -> Result<()> {
-        if functions::delete_messages(chat_id, vec![message_id], true, self.client_id)
-            .await
-            .is_ok()
-        {
-            return Ok(());
+    /// Deletes a message, for everyone when `revoke` is set. If Telegram
+    /// refuses the revoke for lack of rights, deletes it only for us.
+    /// Returns whether it was deleted for everyone.
+    pub async fn delete(&self, chat_id: i64, message_id: i64, revoke: bool) -> Result<bool> {
+        match functions::delete_messages(chat_id, vec![message_id], revoke, self.client_id).await {
+            Ok(()) => Ok(revoke),
+            Err(e) if revoke && is_permission_error(&e) => {
+                functions::delete_messages(chat_id, vec![message_id], false, self.client_id)
+                    .await
+                    .map_err(td_err)?;
+                Ok(false)
+            }
+            Err(e) => Err(td_err(e)),
         }
-        functions::delete_messages(chat_id, vec![message_id], false, self.client_id)
-            .await
-            .map_err(td_err)
+    }
+
+    /// Whether a message can be deleted for everyone and/or only for us.
+    pub async fn delete_rights(&self, chat_id: i64, message_id: i64) -> Result<(bool, bool)> {
+        let enums::MessageProperties::MessageProperties(p) =
+            functions::get_message_properties(chat_id, message_id, self.client_id)
+                .await
+                .map_err(td_err)?;
+        Ok((
+            p.can_be_deleted_for_all_users,
+            p.can_be_deleted_only_for_self,
+        ))
     }
 
     pub async fn download(
@@ -300,6 +325,11 @@ fn text_content(text: types::FormattedText) -> InputMessageContent {
         link_preview_options: None,
         clear_draft: true,
     })
+}
+
+/// Errors that mean "not allowed", as opposed to network or other failures.
+fn is_permission_error(e: &types::Error) -> bool {
+    e.code == 403 || e.message.contains("FORBIDDEN") || e.message.contains("rights")
 }
 
 pub fn td_err(e: types::Error) -> anyhow::Error {
@@ -332,6 +362,42 @@ fn new_key() -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+/// Whether `key` looks like one `new_key` made: 32 bytes as 44 base64 chars.
+fn valid_key(key: &str) -> bool {
+    key.len() == 44
+        && base64::engine::general_purpose::STANDARD
+            .decode(key)
+            .is_ok_and(|b| b.len() == 32)
+}
+
+const NO_KEYRING_HINT: &str = "no usable OS keyring; set `keyring = false` under [telegram] in \
+     the config to keep the key in a 0600 file in the data dir instead";
+
+/// Writes the key to a temporary file, syncs it and renames it into place,
+/// so a crash or a full disk never leaves an empty or partial key file.
+fn write_key_file(path: &Path, key: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = path.with_extension("key.tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let result = (|| -> Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        f.write_all(key.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path).with_context(|| format!("creating {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// The TDLib database is encrypted with a random key from `store`.
 pub fn database_key(database_dir: &Path, store: &KeyStore) -> Result<String> {
     let missing = || {
@@ -343,8 +409,8 @@ pub fn database_key(database_dir: &Path, store: &KeyStore) -> Result<String> {
     let db_exists = database_dir.join("td.binlog").exists();
     match store {
         KeyStore::Keyring => {
-            let entry =
-                keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).context("opening keyring")?;
+            let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
+                .with_context(|| format!("opening keyring ({NO_KEYRING_HINT})"))?;
             match entry.get_password() {
                 Ok(key) => Ok(key),
                 Err(keyring::Error::NoEntry) => {
@@ -355,31 +421,36 @@ pub fn database_key(database_dir: &Path, store: &KeyStore) -> Result<String> {
                     entry.set_password(&key).context("saving key to keyring")?;
                     Ok(key)
                 }
-                Err(e) => Err(anyhow::anyhow!(e).context("reading key from keyring")),
+                Err(e) => Err(anyhow::anyhow!(e)
+                    .context(format!("reading key from keyring ({NO_KEYRING_HINT})"))),
             }
         }
-        KeyStore::File(path) => {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            if let Ok(key) = std::fs::read_to_string(path) {
-                return Ok(key.trim().to_string());
+        KeyStore::File(path) => match std::fs::read_to_string(path) {
+            Ok(key) => {
+                let key = key.trim();
+                if !valid_key(key) {
+                    anyhow::bail!(
+                        "the database key in {} is damaged (expected 44 base64 characters); \
+                         restore it, or delete it and {} to log in again",
+                        path.display(),
+                        database_dir.display()
+                    );
+                }
+                Ok(key.to_string())
             }
-            if db_exists {
-                return Err(missing());
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if db_exists {
+                    return Err(missing());
+                }
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                let key = new_key();
+                write_key_file(path, &key)?;
+                Ok(key)
             }
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            let key = new_key();
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)
-                .with_context(|| format!("creating {}", path.display()))?;
-            f.write_all(key.as_bytes())?;
-            Ok(key)
-        }
+            Err(e) => Err(anyhow::anyhow!(e).context(format!("reading {}", path.display()))),
+        },
     }
 }
 
@@ -395,5 +466,65 @@ pub fn forget_database_key(store: &KeyStore) {
         KeyStore::File(path) => {
             let _ = std::fs::remove_file(path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("telegordo-key-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn key_file_is_created_atomically_and_read_back() {
+        let dir = scratch("new");
+        let path = dir.join("database.key");
+        let store = KeyStore::File(path.clone());
+        let key = database_key(&dir.join("tdlib"), &store).unwrap();
+        assert!(valid_key(&key));
+        assert!(!dir.join("database.key.tmp").exists());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(database_key(&dir.join("tdlib"), &store).unwrap(), key);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_or_damaged_key_file_is_rejected() {
+        let dir = scratch("bad");
+        let path = dir.join("database.key");
+        let store = KeyStore::File(path.clone());
+        for bad in ["", "\n", "short", &"A".repeat(44)] {
+            std::fs::write(&path, bad).unwrap();
+            let e = database_key(&dir.join("tdlib"), &store).unwrap_err();
+            assert!(e.to_string().contains("damaged"), "{bad:?}: {e}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreadable_key_file_is_not_called_missing() {
+        let dir = scratch("perm");
+        let path = dir.join("database.key");
+        std::fs::write(&path, new_key()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let tdlib = dir.join("tdlib");
+        std::fs::create_dir_all(&tdlib).unwrap();
+        std::fs::write(tdlib.join("td.binlog"), "x").unwrap();
+        let result = database_key(&tdlib, &KeyStore::File(path.clone()));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Root can read anything; the check only means something for a normal user.
+        if let Err(e) = result {
+            let msg = format!("{e:#}");
+            assert!(!msg.contains("missing"), "{msg}");
+            assert!(msg.contains("reading"), "{msg}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

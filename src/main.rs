@@ -5,6 +5,7 @@ mod app;
 mod config;
 mod keymap;
 mod notify;
+mod outbox;
 #[cfg(test)]
 mod screenshots;
 #[cfg(test)]
@@ -24,7 +25,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 
-use crate::app::{App, Interrupt};
+use crate::app::{App, Interrupt, Signals};
 use crate::config::Config;
 use crate::keymap::Keymap;
 use crate::tg::{KeyStore, Params, Tg};
@@ -33,7 +34,8 @@ use crate::ui::image::Images;
 #[derive(Parser)]
 #[command(version, about = "A discordo-style Telegram client for the terminal")]
 struct Cli {
-    /// Config file [default: platform config dir/telegordo/config.toml]
+    /// Config file to use instead of the lookup ($XDG_CONFIG_HOME/telegordo,
+    /// ~/.config/telegordo, then the platform config dir); must exist
     #[arg(long)]
     config_path: Option<PathBuf>,
     /// Log file, replaced on each run [default: platform cache dir/telegordo/telegordo.log]
@@ -66,11 +68,12 @@ telegordo needs your own Telegram API credentials.
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let explicit = cli.config_path.is_some();
     let config_path = match cli.config_path {
         Some(p) => p,
         None => config::default_config_path()?,
     };
-    let cfg = Config::load(&config_path)?;
+    let cfg = Config::load(&config_path, explicit)?;
     let dirs = config::project_dirs()?;
     let cache = dirs.cache_dir().to_path_buf();
     std::fs::create_dir_all(&cache).with_context(|| format!("creating {}", cache.display()))?;
@@ -114,12 +117,18 @@ async fn main() -> Result<()> {
 
     let (td_tx, mut td_rx) = tokio::sync::mpsc::unbounded_channel();
     let (app_tx, mut app_rx) = tokio::sync::mpsc::unbounded_channel();
-    // TDLib logs to stderr until told otherwise; keep that off the terminal.
-    let tg = with_stderr_silenced(|| Tg::start(td_tx));
+    // TDLib logs to stderr until its log goes to a file; keep that off the
+    // terminal. The receive thread logs too, so stay silent until then.
+    let silence = StderrRedirect::to_null();
+    let tg = Tg::start(td_tx);
     tg.setup_logging(&cache.join("tdlib.log"), 1).await?;
+    drop(silence);
 
+    // Before the terminal is set up, so a failure leaves it untouched.
+    let mut signals = Signals::new().context("installing signal handlers")?;
     install_panic_hook(cfg.mouse);
-    let mut terminal = ratatui::init();
+    let mut terminal =
+        ratatui::try_init().context("telegordo needs an interactive terminal (a TTY)")?;
     let enhanced = enter_extras(cfg.mouse);
     let images = Images::new(&cfg.images);
     tracing::info!(
@@ -130,18 +139,26 @@ async fn main() -> Result<()> {
             "off (alt+ fallbacks)"
         }
     );
-    let (keys, warnings) = Keymap::build(&cfg.keys, enhanced);
+    let (keys, key_warnings) = Keymap::build(&cfg.keys, enhanced);
+    let warnings: Vec<String> = cfg.warnings.iter().cloned().chain(key_warnings).collect();
     for w in &warnings {
         tracing::warn!("config: {w}");
     }
 
     let mut app = App::new(cfg, keys, tg.clone(), params, images, app_tx);
     if let Some(w) = warnings.first() {
-        app.set_status(format!("config: {w}"));
+        let more = match warnings.len() {
+            1 => String::new(),
+            n => format!(" (+{} more in the log)", n - 1),
+        };
+        app.set_status(format!("config: {w}{more}"));
     }
 
     let result = loop {
-        match app.run(&mut terminal, &mut td_rx, &mut app_rx).await {
+        match app
+            .run(&mut terminal, &mut td_rx, &mut app_rx, &mut signals)
+            .await
+        {
             Ok(None) => break Ok(()),
             Ok(Some(interrupt)) => {
                 leave_extras(app.cfg.mouse, enhanced);
@@ -161,7 +178,9 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                terminal = ratatui::init();
+                // Not `ratatui::init()`: that would stack another panic hook.
+                crossterm::terminal::enable_raw_mode()?;
+                execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
                 enter_extras(app.cfg.mouse);
                 terminal.clear()?;
                 app.dirty = true;
@@ -176,9 +195,27 @@ async fn main() -> Result<()> {
     result
 }
 
+/// Opens the app log, replacing it, readable by the owner only.
+fn open_log(path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("creating log {}", path.display()))?;
+    // `mode` only applies to new files; fix up a log left by an older version.
+    // Only regular files: /dev/null, a FIFO or a tty must not be chmodded.
+    if file.metadata().is_ok_and(|m| m.is_file()) {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod {}", path.display()))?;
+    }
+    Ok(file)
+}
+
 fn init_logging(path: &Path, level: &str) -> Result<()> {
-    let file =
-        std::fs::File::create(path).with_context(|| format!("creating log {}", path.display()))?;
+    let file = open_log(path)?;
     let filter = tracing_subscriber::EnvFilter::try_new(format!("telegordo={level},warn"))
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
@@ -189,20 +226,48 @@ fn init_logging(path: &Path, level: &str) -> Result<()> {
     Ok(())
 }
 
-fn with_stderr_silenced<T>(f: impl FnOnce() -> T) -> T {
-    // SAFETY: plain fd juggling on fd 2, restored before returning.
-    unsafe {
-        let saved = libc::dup(2);
-        let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
-        if saved < 0 || null < 0 {
-            return f();
+/// Points fd 2 somewhere else until dropped, then restores it.
+struct StderrRedirect {
+    saved: Option<libc::c_int>,
+}
+
+impl StderrRedirect {
+    fn to_null() -> Self {
+        Self::to(c"/dev/null")
+    }
+
+    fn to(path: &std::ffi::CStr) -> Self {
+        // SAFETY: plain fd juggling on fd 2; `Drop` puts the saved fd back.
+        unsafe {
+            let target = libc::open(
+                path.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+                0o600,
+            );
+            if target < 0 {
+                return Self { saved: None };
+            }
+            let saved = libc::dup(2);
+            if saved < 0 {
+                libc::close(target);
+                return Self { saved: None };
+            }
+            libc::dup2(target, 2);
+            libc::close(target);
+            Self { saved: Some(saved) }
         }
-        libc::dup2(null, 2);
-        libc::close(null);
-        let out = f();
-        libc::dup2(saved, 2);
-        libc::close(saved);
-        out
+    }
+}
+
+impl Drop for StderrRedirect {
+    fn drop(&mut self) {
+        if let Some(saved) = self.saved.take() {
+            // SAFETY: `saved` is the fd 2 we duplicated in `to`.
+            unsafe {
+                libc::dup2(saved, 2);
+                libc::close(saved);
+            }
+        }
     }
 }
 
@@ -261,16 +326,28 @@ fn run_editor(configured: &str, text: &str) -> Result<String> {
     } else {
         configured.to_string()
     };
-    let path = std::env::temp_dir().join(format!("telegordo-{}.md", std::process::id()));
-    {
-        // Private: the draft may be a private message.
-        let mut f = std::fs::OpenOptions::new()
+    // Private: the draft may be a private message. A random name opened with
+    // O_EXCL never follows a symlink or reuses a file someone else made in a
+    // shared /tmp. The .md suffix makes editors pick markdown mode.
+    let (path, mut f) = loop {
+        let n: u64 = rand::random();
+        let path = std::env::temp_dir().join(format!("telegordo-{n:016x}.md"));
+        match std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
-            .open(&path)?;
-        f.write_all(text.as_bytes())?;
+            .open(&path)
+        {
+            Ok(f) => break (path, f),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).context("creating draft file"),
+        }
+    };
+    let written = f.write_all(text.as_bytes());
+    drop(f);
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&path);
+        return Err(e).context("writing draft file");
     }
     let mut parts = cmd.split_whitespace();
     let program = parts.next().context("empty editor command")?;
@@ -285,4 +362,67 @@ fn run_editor(configured: &str, text: &str) -> Result<String> {
         anyhow::bail!("{program} exited with {status}");
     }
     Ok(edited?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("telegordo-main-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn log_file_is_private_even_if_it_existed() {
+        let dir = scratch("log");
+        let path = dir.join("telegordo.log");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(open_log(&path).unwrap());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "", "truncated");
+        let _ = std::fs::remove_dir_all(&dir);
+        // Devices are used as they are, not chmodded (that fails with EPERM).
+        open_log(Path::new("/dev/null")).expect("/dev/null works as a log");
+    }
+
+    #[test]
+    fn editor_draft_never_touches_the_old_predictable_path() {
+        let old = std::env::temp_dir().join(format!("telegordo-{}.md", std::process::id()));
+        std::fs::write(&old, "victim").unwrap();
+        // `true` leaves the file as written, so the text comes back unchanged.
+        assert_eq!(run_editor("true", "hello").unwrap(), "hello");
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "victim");
+        let _ = std::fs::remove_file(&old);
+    }
+
+    #[test]
+    fn stderr_redirect_is_undone_on_drop() {
+        let dir = scratch("stderr");
+        let cpath = |p: &Path| std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+        let (outer, inner) = (dir.join("outer.txt"), dir.join("inner.txt"));
+        let write2 = |s: &str| unsafe {
+            libc::write(2, s.as_ptr().cast(), s.len());
+        };
+        {
+            let _outer = StderrRedirect::to(&cpath(&outer));
+            {
+                let _inner = StderrRedirect::to(&cpath(&inner));
+                write2("while-inner\n");
+            }
+            // The inner guard put the outer target back.
+            write2("after-inner\n");
+        }
+        let inner = std::fs::read_to_string(&inner).unwrap();
+        let outer = std::fs::read_to_string(&outer).unwrap();
+        assert!(inner.contains("while-inner") && !inner.contains("after-inner"));
+        assert!(outer.contains("after-inner") && !outer.contains("while-inner"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -176,7 +176,15 @@ impl Recorder {
             if app.images.protocol(w.file_id).is_none() {
                 let path = &app.store.files[&w.file_id].local.path;
                 let proto = image::encode(&picker, path, w.cols, w.rows).unwrap();
-                app.images.entries.insert(w.file_id, Entry::Ready(proto));
+                app.images.entries.insert(
+                    w.file_id,
+                    Entry::Ready {
+                        proto,
+                        cols: w.cols,
+                        rows: w.rows,
+                        resizing: None,
+                    },
+                );
             }
         }
         self.term.draw(|f| crate::ui::draw(f, app)).unwrap();
@@ -283,6 +291,7 @@ fn add_chats(app: &mut App) {
             marked_unread: false,
             last_read_inbox: 0,
             mute_for: 0,
+            use_default_mute_for: false,
         };
         s.chats.insert(id, info);
     }
@@ -321,6 +330,7 @@ fn topic(id: i32, name: &str, unread: i32, order: i64) -> Topic {
         order,
         is_pinned: id == 1,
         mute_for: 0,
+        use_default_mute_for: false,
     }
 }
 

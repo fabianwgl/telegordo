@@ -2,6 +2,8 @@
 name = "telegordo"
 version = "0.1.0"
 edition = "2024"
+# keyring 4.2 needs 1.88; developed with 1.100.
+rust-version = "1.88"
 description = "A discordo-style Telegram client for the terminal"
 repository = "https://github.com/fabianwgl/telegordo"
 license = "MIT"

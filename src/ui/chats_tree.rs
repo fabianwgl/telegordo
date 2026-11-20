@@ -95,7 +95,7 @@ pub fn rows(store: &Store, state: &TreeState) -> Vec<Row> {
             label: name,
             unread: chats
                 .iter()
-                .filter(|c| c.has_unread() && !c.muted())
+                .filter(|c| c.has_unread() && !store.chat_muted(c))
                 .count() as i32,
             mentions: 0,
             muted: false,
@@ -119,7 +119,7 @@ pub fn rows(store: &Store, state: &TreeState) -> Vec<Row> {
                     c.unread
                 },
                 mentions: c.unread_mentions,
-                muted: c.muted(),
+                muted: store.chat_muted(c),
                 expandable: forum,
                 expanded,
             });
@@ -131,7 +131,7 @@ pub fn rows(store: &Store, state: &TreeState) -> Vec<Row> {
                         label: format!("# {}", t.info.name),
                         unread: t.unread,
                         mentions: 0,
-                        muted: t.mute_for > 0 || c.muted(),
+                        muted: store.topic_muted(c, t),
                         expandable: false,
                         expanded: false,
                     });
@@ -188,6 +188,7 @@ mod tests {
                 marked_unread: false,
                 last_read_inbox: 0,
                 mute_for: 0,
+                use_default_mute_for: false,
             },
         );
     }

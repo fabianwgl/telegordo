@@ -7,6 +7,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use crate::app::{App, AppEvent, Auth};
 use crate::config::Config;
 use crate::keymap::Keymap;
+use crate::outbox::Op;
 use crate::tg::store::{ChatInfo, ChatKind, ListKey};
 use crate::tg::{KeyStore, Params, Tg};
 use crate::ui::image::Images;
@@ -97,6 +98,7 @@ pub fn chat(app: &mut App, id: i64, title: &str, order: i64, unread: i32, mute_f
             marked_unread: false,
             last_read_inbox: 0,
             mute_for,
+            use_default_mute_for: false,
         },
     );
 }
@@ -110,9 +112,28 @@ pub fn shared_tg() -> Tg {
         let (tx, rx) = unbounded_channel();
         // Updates are not used by tests; keep the receiver alive forever.
         Box::leak(Box::new(rx));
-        Tg::start(tx)
+        let tg = Tg::start(tx);
+        // Keep TDLib's default (verbose) stderr log out of the test output.
+        // The reply comes from the receive thread, so blocking here is fine.
+        let _ = futures::executor::block_on(tdlib_rs::functions::set_log_verbosity_level(
+            0,
+            tg.client_id,
+        ));
+        tg
     })
     .clone()
+}
+
+/// Replaces the app's outbox with a queue the test can read.
+pub fn capture_outbox(app: &mut App) -> UnboundedReceiver<Op> {
+    let (tx, rx) = unbounded_channel();
+    app.outbox = tx;
+    rx
+}
+
+/// Everything queued so far, without waiting.
+pub fn drain(rx: &mut UnboundedReceiver<Op>) -> Vec<Op> {
+    std::iter::from_fn(|| rx.try_recv().ok()).collect()
 }
 
 /// Logged-in app with three chats; "Family" (10) has three messages.
@@ -131,6 +152,8 @@ pub fn app(images: Images, enhanced: bool) -> (App, UnboundedReceiver<AppEvent>)
         key_store: KeyStore::File("/nonexistent".into()),
     };
     let mut app = App::new(cfg, keys, shared_tg(), params, images, tx);
+    // Ops never reach TDLib in tests; `capture_outbox` reads them instead.
+    Box::leak(Box::new(capture_outbox(&mut app)));
     app.auth = Auth::Ready;
     chat(&mut app, 10, "Family", 30, 3, 0);
     chat(&mut app, 11, "Muted news", 20, 9, 3600);

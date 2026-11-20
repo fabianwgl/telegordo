@@ -9,9 +9,20 @@ use ratatui_image::protocol::Protocol;
 use ratatui_image::{FontSize, Resize};
 use tdlib_rs::types::{Photo, PhotoSize};
 
+/// An image's state, with the cell size it was requested or encoded at.
 pub enum Entry {
-    Requested,
-    Ready(Protocol),
+    Requested {
+        cols: u16,
+        rows: u16,
+    },
+    /// Encoded at `cols × rows`. `resizing` is a newer size being encoded;
+    /// the old image stays on screen meanwhile.
+    Ready {
+        proto: Protocol,
+        cols: u16,
+        rows: u16,
+        resizing: Option<(u16, u16)>,
+    },
     Failed,
 }
 
@@ -117,8 +128,51 @@ impl Images {
 
     pub fn protocol(&self, file_id: i32) -> Option<&Protocol> {
         match self.entries.get(&file_id) {
-            Some(Entry::Ready(p)) => Some(p),
+            Some(Entry::Ready { proto, .. }) => Some(proto),
             _ => None,
+        }
+    }
+
+    /// Whether `w` must be (re)requested: never asked for, or wanted at a
+    /// size other than the one shown or on its way (the pane was resized).
+    pub fn needs(&self, w: &Wanted) -> bool {
+        let want = (w.cols, w.rows);
+        match self.entries.get(&w.file_id) {
+            None => true,
+            Some(Entry::Failed) => false,
+            Some(Entry::Requested { cols, rows }) => (*cols, *rows) != want,
+            Some(Entry::Ready {
+                cols,
+                rows,
+                resizing,
+                ..
+            }) => (*cols, *rows) != want && *resizing != Some(want),
+        }
+    }
+
+    /// Records a request for `w`, keeping an encoded image while it resizes.
+    pub fn request(&mut self, w: &Wanted) {
+        let size = (w.cols, w.rows);
+        match self.entries.get_mut(&w.file_id) {
+            Some(Entry::Ready { resizing, .. }) => *resizing = Some(size),
+            _ => {
+                self.entries.insert(
+                    w.file_id,
+                    Entry::Requested {
+                        cols: w.cols,
+                        rows: w.rows,
+                    },
+                );
+            }
+        }
+    }
+
+    /// The size of the newest encode on its way, if any.
+    pub fn latest_request(&self, file_id: i32) -> Option<(u16, u16)> {
+        match self.entries.get(&file_id)? {
+            Entry::Requested { cols, rows } => Some((*cols, *rows)),
+            Entry::Ready { resizing, .. } => *resizing,
+            Entry::Failed => None,
         }
     }
 

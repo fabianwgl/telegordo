@@ -3,7 +3,7 @@
 use chrono::{DateTime, Local, TimeZone};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use tdlib_rs::enums::{MessageContent, MessageOrigin, StickerFormat};
+use tdlib_rs::enums::{MessageContent, MessageOrigin, MessageSendingState, StickerFormat};
 use tdlib_rs::types::{FormattedText, Message};
 use unicode_width::UnicodeWidthStr;
 
@@ -35,6 +35,8 @@ pub struct Layout {
     pub images: Vec<ImageSlot>,
     /// Message id with its first and one-past-last line.
     pub ranges: Vec<(i64, usize, usize)>,
+    /// "Not loaded" marker lines, with the newer end of their gap.
+    pub gaps: Vec<(usize, i64)>,
 }
 
 const NAME_COLORS: [Color; 7] = [
@@ -141,11 +143,12 @@ pub fn parts<'a>(m: &'a Message, store: &Store) -> (Media<'a>, Option<FormattedT
             )
         }
         MessageContent::MessageDocument(d) => (
-            Media::Placeholder(format!(
-                "[File {} {}]",
-                d.document.file_name,
-                human_size(d.document.document.size)
-            )),
+            Media::Placeholder(
+                format!("[File {}", d.document.file_name)
+                    .trim_end()
+                    .to_string()
+                    + &format!(" {}]", human_size(d.document.document.size)),
+            ),
             Some(d.caption.clone()),
         ),
         MessageContent::MessageAnimatedEmoji(e) => (Media::None, plain(e.emoji.clone())),
@@ -246,7 +249,7 @@ pub fn snippet(m: &Message, store: &Store) -> String {
         Media::Placeholder(p) => p,
     };
     let s = format!("{media} {text}");
-    s.trim().replace('\n', " ")
+    s.trim().replace(['\n', '\t'], " ")
 }
 
 fn truncate(s: &str, width: usize) -> String {
@@ -298,8 +301,38 @@ pub fn layout(
     let mut out = Layout::default();
     let mut last_day = None;
     let mut last_sender: Option<(i64, i32)> = None;
+    let gaps = msgs
+        .first()
+        .and_then(|m| store.gaps.get(&m.chat_id))
+        .cloned()
+        .unwrap_or_default();
+    let mut prev_id: Option<i64> = None;
 
     for m in msgs {
+        // A gap that ends at or before this message and starts after the previous one.
+        if let Some(prev) = prev_id
+            && let Some((&newer_end, gap)) = gaps
+                .range(prev + 1..=m.id)
+                .find(|(_, g)| g.older_end >= prev)
+        {
+            let label = if gap.failed {
+                " older messages failed to load "
+            } else {
+                " older messages not loaded "
+            };
+            let side = width.saturating_sub(label.width()) / 2;
+            out.gaps.push((out.lines.len(), newer_end));
+            out.lines.push(Line::from(Span::styled(
+                format!(
+                    "{}{label}{}",
+                    "┄".repeat(side),
+                    "┄".repeat(width.saturating_sub(side + label.width()))
+                ),
+                dim.add_modifier(Modifier::ITALIC),
+            )));
+            last_sender = None;
+        }
+        prev_id = Some(m.id);
         let when = local(m.date);
         if cfg.date_separator.enabled && last_day != Some(when.date_naive()) {
             let label = format!(" {} ", when.format(&cfg.date_separator.format));
@@ -361,8 +394,8 @@ pub fn layout(
             if m.edit_date != 0 {
                 header.push(Span::styled("  (edited)", dim));
             }
-            if m.sending_state.is_some() {
-                header.push(Span::styled("  sending…", dim));
+            if let Some(s) = sending_marker(m) {
+                header.push(Span::styled(format!("  {}", s.content), s.style));
             }
             out.lines.push(Line::from(header));
         }
@@ -446,6 +479,14 @@ pub fn layout(
         {
             last.spans.push(Span::styled(" (edited)", dim));
         }
+        // Grouped messages have no header, so the marker goes on the last line.
+        if grouped
+            && let Some(s) = sending_marker(m)
+            && let Some(last) = out.lines.last_mut()
+        {
+            last.spans
+                .push(Span::styled(format!(" {}", s.content), s.style));
+        }
 
         let end = out.lines.len();
         if selected == Some(m.id) {
@@ -456,6 +497,20 @@ pub fn layout(
         out.ranges.push((m.id, start, end));
     }
     out
+}
+
+/// "sending…" while TDLib sends the message, or the error when it failed.
+fn sending_marker(m: &Message) -> Option<Span<'static>> {
+    match &m.sending_state {
+        None => None,
+        Some(MessageSendingState::Pending(_)) => {
+            Some(Span::styled("sending…", Style::new().fg(Color::DarkGray)))
+        }
+        Some(MessageSendingState::Failed(f)) => Some(Span::styled(
+            format!("failed: {}", f.error.message),
+            Style::new().fg(Color::Red),
+        )),
+    }
 }
 
 fn photo_dims(p: &tdlib_rs::types::Photo) -> (i32, i32) {
